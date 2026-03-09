@@ -6,6 +6,7 @@ use crate::{
 };
 use quinn::{
     congestion::{BbrConfig, CubicConfig, NewRenoConfig},
+    crypto::rustls::QuicServerConfig,
     Endpoint, EndpointConfig, IdleTimeout, ServerConfig, TokioRuntime, TransportConfig, VarInt,
 };
 use rustls::{version, ServerConfig as RustlsServerConfig};
@@ -35,11 +36,7 @@ impl Server {
         let certs = utils::load_certs(cfg.certificate)?;
         let priv_key = utils::load_priv_key(cfg.private_key)?;
 
-        let mut crypto = RustlsServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&version::TLS13])
-            .unwrap()
+        let mut crypto = RustlsServerConfig::builder_with_protocol_versions(&[&version::TLS13])
             .with_no_client_auth()
             .with_single_cert(certs, priv_key)?;
 
@@ -47,7 +44,10 @@ impl Server {
         crypto.max_early_data_size = u32::MAX;
         crypto.send_half_rtt_data = cfg.zero_rtt_handshake;
 
-        let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+        let mut config = ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+        ));
         let mut tp_cfg = TransportConfig::default();
 
         tp_cfg
@@ -122,8 +122,16 @@ impl Server {
         );
 
         loop {
-            let Some(conn) = self.ep.accept().await else {
+            let Some(incoming) = self.ep.accept().await else {
                 return;
+            };
+
+            let conn = match incoming.accept() {
+                Ok(conn) => conn,
+                Err(err) => {
+                    log::warn!("failed to accept incoming connection: {err}");
+                    continue;
+                }
             };
 
             tokio::spawn(Connection::handle(
