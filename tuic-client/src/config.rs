@@ -127,6 +127,9 @@ pub struct Local {
 
     #[serde(default = "default::local::max_packet_size")]
     pub max_packet_size: usize,
+
+    #[serde(default)]
+    pub enable_http: bool,
 }
 
 impl Config {

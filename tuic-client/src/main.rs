@@ -9,6 +9,7 @@ use std::{env, process};
 mod config;
 mod connection;
 mod error;
+mod http;
 mod socks5;
 mod utils;
 
