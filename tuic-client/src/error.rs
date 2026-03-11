@@ -13,6 +13,7 @@ pub enum Error {
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error("load native certificates error: {0}")]
+    #[allow(dead_code)]
     LoadNativeCerts(IoError),
     #[error(transparent)]
     Rustls(#[from] RustlsError),

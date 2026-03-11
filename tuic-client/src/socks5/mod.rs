@@ -1,11 +1,13 @@
 use crate::{config::Local, error::Error};
+use async_trait::async_trait;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use socks5_server::{
-    auth::{NoAuth, Password},
-    Auth, Connection, Server as Socks5Server,
+use socks5_proto::handshake::{
+    password::{Request as PasswordRequest, Response as PasswordResponse},
+    Method,
 };
+use socks5_server::{auth::Auth, Command, Server as Socks5Server};
 use std::{
     collections::HashMap,
     net::{SocketAddr, TcpListener as StdTcpListener},
@@ -14,7 +16,7 @@ use std::{
         Arc,
     },
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 mod handle_task;
 mod udp_session;
@@ -23,8 +25,48 @@ pub use self::udp_session::UDP_SESSIONS;
 
 static SERVER: OnceCell<Server> = OnceCell::new();
 
+struct NoAuthAdapter;
+
+#[async_trait]
+impl Auth for NoAuthAdapter {
+    type Output = bool;
+
+    fn as_handshake_method(&self) -> Method {
+        Method::NONE
+    }
+
+    async fn execute(&self, _stream: &mut TcpStream) -> bool {
+        true
+    }
+}
+
+struct PasswordAdapter {
+    username: Vec<u8>,
+    password: Vec<u8>,
+}
+
+#[async_trait]
+impl Auth for PasswordAdapter {
+    type Output = bool;
+
+    fn as_handshake_method(&self) -> Method {
+        Method::PASSWORD
+    }
+
+    async fn execute(&self, stream: &mut TcpStream) -> bool {
+        let req = match PasswordRequest::read_from(stream).await {
+            Ok(req) => req,
+            Err(_) => return false,
+        };
+        let ok = req.username == self.username && req.password == self.password;
+        let resp = PasswordResponse::new(ok);
+        let _ = resp.write_to(stream).await;
+        ok
+    }
+}
+
 pub struct Server {
-    inner: Socks5Server,
+    inner: Socks5Server<bool>,
     dual_stack: Option<bool>,
     max_pkt_size: usize,
     next_assoc_id: AtomicU16,
@@ -93,9 +135,9 @@ impl Server {
                 .map_err(|err| Error::Socket("failed to create socks5 server socket", err))?
         };
 
-        let auth: Arc<dyn Auth + Send + Sync> = match (username, password) {
-            (Some(username), Some(password)) => Arc::new(Password::new(username, password)),
-            (None, None) => Arc::new(NoAuth),
+        let auth: Arc<dyn Auth<Output = bool> + Send + Sync> = match (username, password) {
+            (Some(username), Some(password)) => Arc::new(PasswordAdapter { username, password }),
+            (None, None) => Arc::new(NoAuthAdapter),
             _ => return Err(Error::InvalidSocks5Auth),
         };
 
@@ -121,9 +163,23 @@ impl Server {
                     log::debug!("[socks5] [{addr}] connection established");
 
                     tokio::spawn(async move {
-                        match conn.handshake().await {
-                            Ok(Connection::Associate(associate, _)) => {
-                                let assoc_id = server.next_assoc_id.fetch_add(1, Ordering::Relaxed);
+                        let (conn, auth_ok) = match conn.authenticate().await {
+                            Ok(result) => result,
+                            Err((err, _)) => {
+                                log::warn!("[socks5] [{addr}] handshake error: {err}");
+                                return;
+                            }
+                        };
+
+                        if !auth_ok {
+                            log::warn!("[socks5] [{addr}] authentication failed");
+                            return;
+                        }
+
+                        match conn.wait().await {
+                            Ok(Command::Associate(associate, _)) => {
+                                let assoc_id =
+                                    server.next_assoc_id.fetch_add(1, Ordering::Relaxed);
                                 log::info!("[socks5] [{addr}] [associate] [{assoc_id:#06x}]");
                                 Self::handle_associate(
                                     associate,
@@ -133,16 +189,18 @@ impl Server {
                                 )
                                 .await;
                             }
-                            Ok(Connection::Bind(bind, _)) => {
+                            Ok(Command::Bind(bind, _)) => {
                                 log::info!("[socks5] [{addr}] [bind]");
                                 Self::handle_bind(bind).await;
                             }
-                            Ok(Connection::Connect(connect, target_addr)) => {
+                            Ok(Command::Connect(connect, target_addr)) => {
                                 log::info!("[socks5] [{addr}] [connect] {target_addr}");
                                 Self::handle_connect(connect, target_addr).await;
                             }
-                            Err(err) => log::warn!("[socks5] [{addr}] handshake error: {err}"),
-                        };
+                            Err((err, _)) => {
+                                log::warn!("[socks5] [{addr}] command error: {err}")
+                            }
+                        }
 
                         log::debug!("[socks5] [{addr}] connection closed");
                     });

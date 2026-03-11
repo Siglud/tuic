@@ -56,10 +56,15 @@ impl Connection {
 
             if let Some(mut stream) = stream {
                 let mut conn = conn.compat();
-                let res = io::copy_bidirectional(&mut conn, &mut stream).await;
+                let copy_result = tokio::select! {
+                    res = io::copy_bidirectional(&mut conn, &mut stream) => Some(res),
+                    _ = self.inner.closed() => None,
+                };
                 let _ = conn.get_mut().reset(ERROR_CODE);
                 let _ = stream.shutdown().await;
-                res?;
+                if let Some(res) = copy_result {
+                    res?;
+                }
                 Ok::<_, Error>(())
             } else {
                 let _ = conn.compat().shutdown().await;

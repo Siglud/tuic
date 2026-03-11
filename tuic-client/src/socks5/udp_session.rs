@@ -3,7 +3,7 @@ use bytes::Bytes;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use socks5_proto::Address;
+use socks5_proto::{Address, UdpHeader};
 use socks5_server::AssociatedUdpSocket;
 use std::{
     collections::HashMap,
@@ -66,7 +66,7 @@ impl UdpSession {
         })?;
 
         Ok(Self {
-            socket: Arc::new(AssociatedUdpSocket::from((socket, max_pkt_size))),
+            socket: Arc::new(AssociatedUdpSocket::new(socket, max_pkt_size)),
             assoc_id,
             ctrl_addr,
         })
@@ -74,20 +74,20 @@ impl UdpSession {
 
     pub async fn send(&self, pkt: Bytes, src_addr: Address) -> Result<(), Error> {
         let src_addr_display = src_addr.to_string();
+        let dst_addr = self.socket.get_ref().peer_addr().unwrap_or(self.ctrl_addr);
 
         log::debug!(
             "[socks5] [{ctrl_addr}] [associate] [{assoc_id:#06x}] send packet from {src_addr_display} to {dst_addr}",
             ctrl_addr = self.ctrl_addr,
             assoc_id = self.assoc_id,
-            dst_addr = self.socket.peer_addr().unwrap(),
         );
 
-        if let Err(err) = self.socket.send(pkt, 0, src_addr).await {
+        let header = UdpHeader::new(0, src_addr);
+        if let Err(err) = self.socket.send_to(pkt, &header, dst_addr).await {
             log::warn!(
                 "[socks5] [{ctrl_addr}] [associate] [{assoc_id:#06x}] send packet from {src_addr_display} to {dst_addr} error: {err}",
                 ctrl_addr = self.ctrl_addr,
                 assoc_id = self.assoc_id,
-                dst_addr = self.socket.peer_addr().unwrap(),
             );
 
             return Err(Error::Io(err));
@@ -97,9 +97,13 @@ impl UdpSession {
     }
 
     pub async fn recv(&self) -> Result<(Bytes, Address), Error> {
-        let (pkt, frag, dst_addr, src_addr) = self.socket.recv_from().await?;
+        let (pkt, header, src_addr) = self
+            .socket
+            .recv_from()
+            .await
+            .map_err(|(e, _)| Error::Io(IoError::new(ErrorKind::Other, e.to_string())))?;
 
-        if let Ok(connected_addr) = self.socket.peer_addr() {
+        if let Ok(connected_addr) = self.socket.get_ref().peer_addr() {
             let connected_addr = match connected_addr {
                 SocketAddr::V4(addr) => {
                     if let SocketAddr::V6(_) = src_addr {
@@ -121,32 +125,33 @@ impl UdpSession {
                 }
             };
             if src_addr != connected_addr {
-                Err(IoError::new(
+                return Err(Error::Io(IoError::new(
                     ErrorKind::Other,
                     format!("invalid source address: {src_addr}"),
-                ))?;
+                )));
             }
         } else {
-            self.socket.connect(src_addr).await?;
+            self.socket.get_ref().connect(src_addr).await?;
         }
 
-        if frag != 0 {
-            Err(IoError::new(
+        if header.frag != 0 {
+            return Err(Error::Io(IoError::new(
                 ErrorKind::Other,
                 "fragmented packet is not supported",
-            ))?;
+            )));
         }
 
         log::debug!(
             "[socks5] [{ctrl_addr}] [associate] [{assoc_id:#06x}] receive packet from {src_addr} to {dst_addr}",
             ctrl_addr = self.ctrl_addr,
-            assoc_id = self.assoc_id
+            assoc_id = self.assoc_id,
+            dst_addr = header.address,
         );
 
-        Ok((pkt, dst_addr))
+        Ok((pkt, header.address))
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
-        self.socket.local_addr()
+        self.socket.get_ref().local_addr()
     }
 }
