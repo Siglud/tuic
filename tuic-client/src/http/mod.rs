@@ -72,7 +72,15 @@ async fn inner_handle(
     // Verify proxy authentication when credentials are configured
     if let (Some(required_user), Some(required_pass)) = (username, password) {
         let auth_ok = proxy_authorization
-            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|v| {
+                // Split into scheme and credentials, and compare scheme case-insensitively
+                let (scheme, param) = v.split_once(' ')?;
+                if scheme.eq_ignore_ascii_case("Basic") {
+                    Some(param)
+                } else {
+                    None
+                }
+            })
             .and_then(|b64| decode_base64(b64.trim()))
             .map(|decoded| {
                 decoded
