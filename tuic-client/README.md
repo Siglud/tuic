@@ -133,12 +133,10 @@ tuic-client -c PATH/TO/CONFIG
         // Default: false
         "enable_http": false,
 
-        // Optional. Set if the listening socket should be dual-stack
+        // Optional. Set if the listening socket should be dual-stack (e.g. an IPv6
+        // listening address also accepts IPv4 connections when supported by the OS)
         // If this option is not set, the socket behavior is platform dependent
-        // Note: ignored when "enable_http" is true (the socket is always created as per
-        // the address family of the "server" field)
         "dual_stack": true,
-
         // Optional. Maximum packet size the SOCKS5 server can receive from external, in bytes
         // Note: ignored for HTTP proxy connections
         // Default: 1500
