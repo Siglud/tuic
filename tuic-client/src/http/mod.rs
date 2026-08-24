@@ -1,13 +1,21 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::net::SocketAddr;
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
 mod handle_task;
 
 const MAX_REQUEST_HEAD_SIZE: usize = 16 * 1024;
+
+async fn write_http_response<W>(stream: &mut W, response: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream.write_all(response).await?;
+    stream.flush().await
+}
 
 struct RequestHead<'a> {
     method: &'a str,
@@ -39,14 +47,14 @@ async fn inner_handle(
 
     if let (Some(required_user), Some(required_pass)) = (username, password) {
         if !valid_basic_auth(request.proxy_authorization, required_user, required_pass) {
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                       Proxy-Authenticate: Basic realm=\"tuic-client\"\r\n\
                       Content-Length: 0\r\n\
                       Connection: close\r\n\r\n",
-                )
-                .await;
+            )
+            .await;
             return Ok(());
         }
     }
@@ -178,7 +186,109 @@ fn valid_basic_auth(header: Option<&str>, required_user: &[u8], required_pass: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Waker},
+    };
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct FlushState {
+        buffered: Vec<u8>,
+        flushed: Vec<u8>,
+        flush_pending: bool,
+        allow_flush: bool,
+        dropped: bool,
+        dropped_with_buffered_data: bool,
+        flush_waker: Option<Waker>,
+    }
+
+    struct PendingFlushWriter {
+        state: Arc<Mutex<FlushState>>,
+    }
+
+    impl AsyncWrite for PendingFlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.state.lock().unwrap().buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.state.lock().unwrap();
+            if !state.allow_flush {
+                state.flush_pending = true;
+                state.flush_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+
+            let buffered = std::mem::take(&mut state.buffered);
+            state.flushed.extend_from_slice(&buffered);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    impl Drop for PendingFlushWriter {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.dropped = true;
+            state.dropped_with_buffered_data = !state.buffered.is_empty();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_response_is_flushed_before_writer_can_close() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+
+        let state = Arc::new(Mutex::new(FlushState::default()));
+        let writer = PendingFlushWriter {
+            state: Arc::clone(&state),
+        };
+        let write_task = tokio::spawn(async move {
+            let mut writer = writer;
+            write_http_response(&mut writer, RESPONSE).await
+        });
+
+        loop {
+            if state.lock().unwrap().flush_pending {
+                break;
+            }
+            assert!(
+                !write_task.is_finished(),
+                "response write completed without polling flush"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.buffered, RESPONSE);
+            assert!(state.flushed.is_empty());
+            assert!(!state.dropped);
+        }
+
+        let flush_waker = {
+            let mut state = state.lock().unwrap();
+            state.allow_flush = true;
+            state.flush_waker.take().unwrap()
+        };
+        flush_waker.wake();
+
+        write_task.await.unwrap().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.flushed, RESPONSE);
+        assert!(state.buffered.is_empty());
+        assert!(state.dropped);
+        assert!(!state.dropped_with_buffered_data);
+    }
 
     #[tokio::test]
     async fn reads_fragmented_request_head() {
