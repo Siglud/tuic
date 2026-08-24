@@ -111,8 +111,9 @@ impl Header {
 /// Address type `None` is used in `Packet` commands that is not the first fragment of a UDP packet.
 ///
 /// The port number is encoded in 2 bytes after the Domain name / IP address.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Address {
+    #[default]
     None,
     DomainAddress(String, u16),
     SocketAddress(SocketAddr),
@@ -183,8 +184,90 @@ impl Display for Address {
     }
 }
 
-impl Default for Address {
-    fn default() -> Self {
-        Self::None
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use uuid::Uuid;
+
+    #[test]
+    fn header_type_codes_and_lengths_match_commands() {
+        let headers = [
+            Header::Authenticate(Authenticate::new(Uuid::nil(), [0; 32])),
+            Header::Connect(Connect::new(Address::DomainAddress(
+                "example.com".into(),
+                443,
+            ))),
+            Header::Packet(Packet::new(1, 2, 1, 0, 3, Address::None)),
+            Header::Dissociate(Dissociate::new(1)),
+            Header::Heartbeat(Heartbeat::new()),
+        ];
+
+        assert_eq!(VERSION, 0x05);
+        assert_eq!(
+            [
+                Header::TYPE_CODE_AUTHENTICATE,
+                Header::TYPE_CODE_CONNECT,
+                Header::TYPE_CODE_PACKET,
+                Header::TYPE_CODE_DISSOCIATE,
+                Header::TYPE_CODE_HEARTBEAT,
+            ],
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            headers.each_ref().map(|header| header.type_code()),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            headers.each_ref().map(|header| header.len()),
+            [50, 17, 11, 4, 2]
+        );
+    }
+
+    #[test]
+    fn address_classification_type_codes_and_lengths() {
+        let none = Address::None;
+        let domain = Address::DomainAddress("example.com".into(), 443);
+        let ipv4 = Address::SocketAddress((Ipv4Addr::new(192, 0, 2, 1), 443).into());
+        let ipv6 =
+            Address::SocketAddress((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443).into());
+
+        assert!(none.is_none());
+        assert!(domain.is_domain());
+        assert!(ipv4.is_ipv4());
+        assert!(ipv6.is_ipv6());
+        assert_eq!(
+            [
+                none.type_code(),
+                domain.type_code(),
+                ipv4.type_code(),
+                ipv6.type_code()
+            ],
+            [0xff, 0x00, 0x01, 0x02]
+        );
+        assert_eq!(
+            [none.len(), domain.len(), ipv4.len(), ipv6.len()],
+            [1, 15, 7, 19]
+        );
+    }
+
+    #[test]
+    fn address_default_take_and_display() {
+        let mut domain = Address::DomainAddress("example.com".into(), 443);
+        let taken = domain.take();
+
+        assert_eq!(Address::default(), Address::None);
+        assert_eq!(domain, Address::None);
+        assert_eq!(taken.to_string(), "example.com:443");
+        assert_eq!(Address::None.to_string(), "none");
+        assert_eq!(
+            Address::SocketAddress((Ipv4Addr::new(192, 0, 2, 1), 443).into()).to_string(),
+            "192.0.2.1:443"
+        );
+        assert_eq!(
+            Address::SocketAddress((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443).into())
+                .to_string(),
+            "[2001:db8::1]:443"
+        );
     }
 }

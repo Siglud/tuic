@@ -7,6 +7,12 @@ use std::sync::atomic::Ordering;
 use tokio::time;
 use tuic_quinn::Task;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketSource {
+    Datagram,
+    UniStream,
+}
+
 impl Connection {
     pub async fn handle_uni_stream(self, recv: RecvStream, _reg: Register) {
         log::debug!(
@@ -18,12 +24,12 @@ impl Connection {
 
         let max = self.max_concurrent_uni_streams.load(Ordering::Relaxed);
 
-        if self.remote_uni_stream_cnt.count() as u32 == max {
+        if let Some(next) = increased_stream_limit(self.remote_uni_stream_cnt.count(), max) {
             self.max_concurrent_uni_streams
-                .store(max * 2, Ordering::Relaxed);
+                .store(next, Ordering::Relaxed);
 
             self.inner
-                .set_max_concurrent_uni_streams(VarInt::from(max * 2));
+                .set_max_concurrent_uni_streams(VarInt::from(next));
         }
 
         let pre_process = async {
@@ -43,9 +49,9 @@ impl Connection {
                 err = self.inner.closed() => return Err(Error::from(err)),
             };
 
-            let same_pkt_src = matches!(task, Task::Packet(_))
-                && matches!(self.udp_relay_mode.load(), Some(UdpRelayMode::Native));
-            if same_pkt_src {
+            let wrong_pkt_src = matches!(task, Task::Packet(_))
+                && !accepts_packet_source(self.udp_relay_mode.load(), PacketSource::UniStream);
+            if wrong_pkt_src {
                 return Err(Error::UnexpectedPacketSource);
             }
 
@@ -79,12 +85,11 @@ impl Connection {
 
         let max = self.max_concurrent_bi_streams.load(Ordering::Relaxed);
 
-        if self.remote_bi_stream_cnt.count() as u32 == max {
+        if let Some(next) = increased_stream_limit(self.remote_bi_stream_cnt.count(), max) {
             self.max_concurrent_bi_streams
-                .store(max * 2, Ordering::Relaxed);
+                .store(next, Ordering::Relaxed);
 
-            self.inner
-                .set_max_concurrent_bi_streams(VarInt::from(max * 2));
+            self.inner.set_max_concurrent_bi_streams(VarInt::from(next));
         }
 
         let pre_process = async {
@@ -134,9 +139,9 @@ impl Connection {
                 err = self.inner.closed() => return Err(Error::from(err)),
             };
 
-            let same_pkt_src = matches!(task, Task::Packet(_))
-                && matches!(self.udp_relay_mode.load(), Some(UdpRelayMode::Quic));
-            if same_pkt_src {
+            let wrong_pkt_src = matches!(task, Task::Packet(_))
+                && !accepts_packet_source(self.udp_relay_mode.load(), PacketSource::Datagram);
+            if wrong_pkt_src {
                 return Err(Error::UnexpectedPacketSource);
             }
 
@@ -157,5 +162,61 @@ impl Connection {
                 self.close();
             }
         }
+    }
+}
+
+fn increased_stream_limit(count: usize, current_limit: u32) -> Option<u32> {
+    if count >= current_limit as usize {
+        Some(current_limit.saturating_mul(2))
+    } else {
+        None
+    }
+}
+
+fn accepts_packet_source(mode: Option<UdpRelayMode>, source: PacketSource) -> bool {
+    matches!(
+        (mode, source),
+        (None, _)
+            | (Some(UdpRelayMode::Native), PacketSource::Datagram)
+            | (Some(UdpRelayMode::Quic), PacketSource::UniStream)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_limit_doubles_at_or_above_capacity_and_saturates() {
+        assert_eq!(increased_stream_limit(31, 32), None);
+        assert_eq!(increased_stream_limit(32, 32), Some(64));
+        assert_eq!(increased_stream_limit(33, 32), Some(64));
+        assert_eq!(increased_stream_limit(usize::MAX, u32::MAX), Some(u32::MAX));
+    }
+
+    #[test]
+    fn first_packet_source_is_accepted() {
+        assert!(accepts_packet_source(None, PacketSource::Datagram));
+        assert!(accepts_packet_source(None, PacketSource::UniStream));
+    }
+
+    #[test]
+    fn established_udp_mode_accepts_only_matching_packet_source() {
+        assert!(accepts_packet_source(
+            Some(UdpRelayMode::Native),
+            PacketSource::Datagram
+        ));
+        assert!(!accepts_packet_source(
+            Some(UdpRelayMode::Native),
+            PacketSource::UniStream
+        ));
+        assert!(accepts_packet_source(
+            Some(UdpRelayMode::Quic),
+            PacketSource::UniStream
+        ));
+        assert!(!accepts_packet_source(
+            Some(UdpRelayMode::Quic),
+            PacketSource::Datagram
+        ));
     }
 }

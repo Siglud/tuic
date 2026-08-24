@@ -30,7 +30,7 @@ pub use self::{
     connect::Connect,
     dissociate::Dissociate,
     heartbeat::Heartbeat,
-    packet::{Fragments, Packet},
+    packet::{Fragment, Fragments, Packet},
 };
 
 /// An abstraction of a TUIC connection, with packet fragmentation management and task counters. No I/O operation is involved internally
@@ -277,7 +277,7 @@ where
     }
 
     fn collect_garbage(&mut self, timeout: Duration) {
-        for (_, session) in self.sessions.iter_mut() {
+        for session in self.sessions.values_mut() {
             session.collect_garbage(timeout);
         }
     }
@@ -416,7 +416,17 @@ where
         addr: Address,
         data: B,
     ) -> Result<Option<Assemblable<B>>, AssembleError> {
-        assert_eq!(data.as_ref().len(), size as usize);
+        let actual_size = data.as_ref().len();
+        if actual_size != size as usize {
+            return Err(AssembleError::InvalidPayloadSize(size, actual_size));
+        }
+
+        if frag_total != self.frag_total {
+            return Err(AssembleError::ConflictingFragmentTotal(
+                self.frag_total,
+                frag_total,
+            ));
+        }
 
         if frag_id >= frag_total {
             return Err(AssembleError::InvalidFragmentId(frag_total, frag_id));
@@ -510,10 +520,222 @@ where
 /// An error that can occur when assembling a packet
 #[derive(Debug, Error)]
 pub enum AssembleError {
+    #[error("payload size {1} does not match advertised size {0}")]
+    InvalidPayloadSize(u16, usize),
+    #[error("fragment total {1} conflicts with initial total {0}")]
+    ConflictingFragmentTotal(u8, u8),
     #[error("invalid fragment id {1} in total {0} fragments")]
     InvalidFragmentId(u8, u8),
     #[error("{0}")]
     InvalidAddress(&'static str),
     #[error("duplicated fragment: {0}")]
     DuplicatedFragment(u8),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> Address {
+        Address::DomainAddress("example.com".into(), 443)
+    }
+
+    #[test]
+    fn connection_enforces_associations_and_allocates_packet_ids() {
+        let connection = Connection::<Vec<u8>>::new();
+        assert_eq!(connection.task_connect_count(), 0);
+        assert_eq!(connection.task_associate_count(), 0);
+        assert!(connection
+            .recv_packet(PacketHeader::new(7, 0, 1, 0, 1, target()))
+            .is_none());
+
+        let first = connection.send_packet(7, target(), 64);
+        let second = connection.send_packet(7, target(), 64);
+        let other = connection.clone().send_packet(9, target(), 64);
+        assert_eq!((first.pkt_id(), second.pkt_id(), other.pkt_id()), (0, 1, 0));
+        assert_eq!(connection.task_associate_count(), 2);
+        assert!(connection
+            .recv_packet(PacketHeader::new(7, 2, 1, 0, 1, target()))
+            .is_some());
+
+        let debug = format!("{connection:?}");
+        assert!(debug.contains("task_connect_count: 0"));
+        assert!(debug.contains("task_associate_count: 2"));
+    }
+
+    #[test]
+    fn unrestricted_receive_creates_association_and_reassembles_single_fragment() {
+        let connection = Connection::<Vec<u8>>::new();
+        assert!(connection
+            .recv_packet(PacketHeader::new(7, 11, 1, 0, 3, target()))
+            .is_none());
+
+        let packet =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 1, 0, 3, target()));
+        assert_eq!(connection.task_associate_count(), 1);
+        let assemblable = packet.assemble(vec![1, 2, 3]).unwrap().unwrap();
+        let mut output = Vec::new();
+        let (address, assoc_id) = assemblable.assemble(&mut output);
+
+        assert_eq!(output, [1, 2, 3]);
+        assert_eq!(address, target());
+        assert_eq!(assoc_id, 7);
+        assert!(connection
+            .recv_packet(PacketHeader::new(7, 12, 1, 0, 1, target()))
+            .is_some());
+    }
+
+    #[test]
+    fn reassembles_out_of_order_fragments_with_custom_assembler() {
+        #[derive(Default)]
+        struct ChunkAssembler(Vec<Vec<u8>>);
+
+        impl Assembler<Vec<u8>> for ChunkAssembler {
+            fn assemble(&mut self, data: impl IntoIterator<Item = Vec<u8>>) {
+                self.0 = data.into_iter().collect();
+            }
+        }
+
+        let connection = Connection::<Vec<u8>>::new();
+        let last =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 3, 2, 1, Address::None));
+        assert!(last.assemble(vec![3]).unwrap().is_none());
+
+        let first =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 3, 0, 1, target()));
+        assert!(first.assemble(vec![1]).unwrap().is_none());
+
+        let middle =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 3, 1, 1, Address::None));
+        let assemblable = middle.assemble(vec![2]).unwrap().unwrap();
+        let mut output = ChunkAssembler::default();
+        let (address, assoc_id) = assemblable.assemble(&mut output);
+
+        assert_eq!(output.0, [vec![1], vec![2], vec![3]]);
+        assert_eq!(address, target());
+        assert_eq!(assoc_id, 7);
+    }
+
+    #[test]
+    fn packet_buffer_rejects_duplicate_and_invalid_fragment_ids() {
+        let mut buffer = PacketBuffer::new(2);
+        assert!(buffer
+            .insert(7, 2, 0, 1, target(), vec![1])
+            .unwrap()
+            .is_none());
+        let duplicate = buffer.insert(7, 2, 0, 1, target(), vec![1]).unwrap_err();
+        assert!(matches!(duplicate, AssembleError::DuplicatedFragment(0)));
+
+        let mut buffer = PacketBuffer::new(2);
+        let invalid = buffer
+            .insert(7, 2, 2, 1, Address::None, vec![1])
+            .unwrap_err();
+        assert!(matches!(invalid, AssembleError::InvalidFragmentId(2, 2)));
+
+        let mut buffer = PacketBuffer::new(0);
+        let empty_total = buffer.insert(7, 0, 0, 1, target(), vec![1]).unwrap_err();
+        assert!(matches!(
+            empty_total,
+            AssembleError::InvalidFragmentId(0, 0)
+        ));
+    }
+
+    #[test]
+    fn packet_buffer_enforces_fragment_address_rules() {
+        let mut first = PacketBuffer::new(1);
+        let missing = first
+            .insert(7, 1, 0, 1, Address::None, vec![1])
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            AssembleError::InvalidAddress("no address in first fragment")
+        ));
+
+        let mut continuation = PacketBuffer::new(2);
+        let present = continuation
+            .insert(7, 2, 1, 1, target(), vec![1])
+            .unwrap_err();
+        assert!(matches!(
+            present,
+            AssembleError::InvalidAddress("address in non-first fragment")
+        ));
+    }
+
+    #[test]
+    fn packet_buffer_rejects_wrong_payload_size() {
+        let mut buffer = PacketBuffer::new(1);
+        let error = buffer
+            .insert(
+                7,
+                1,
+                0,
+                2,
+                Address::DomainAddress("example.com".into(), 443),
+                vec![1],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AssembleError::InvalidPayloadSize(2, 1)));
+        let assemblable = buffer
+            .insert(7, 1, 0, 1, target(), vec![1])
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::new();
+        assemblable.assemble(&mut output);
+        assert_eq!(output, [1]);
+    }
+
+    #[test]
+    fn packet_buffer_rejects_conflicting_fragment_total() {
+        let mut buffer = PacketBuffer::new(2);
+        assert!(buffer
+            .insert(
+                7,
+                2,
+                0,
+                1,
+                Address::DomainAddress("example.com".into(), 443),
+                vec![1],
+            )
+            .unwrap()
+            .is_none());
+
+        let error = buffer
+            .insert(7, 3, 2, 1, Address::None, vec![2])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AssembleError::ConflictingFragmentTotal(2, 3)
+        ));
+        let assemblable = buffer
+            .insert(7, 2, 1, 1, Address::None, vec![2])
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::new();
+        assemblable.assemble(&mut output);
+        assert_eq!(output, [1, 2]);
+    }
+
+    #[test]
+    fn garbage_collection_discards_incomplete_fragments() {
+        let connection = Connection::<Vec<u8>>::new();
+        let old_first =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 2, 0, 3, target()));
+        assert!(old_first.assemble(b"old".to_vec()).unwrap().is_none());
+
+        connection.collect_garbage(Duration::ZERO);
+
+        let continuation =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 2, 1, 4, Address::None));
+        assert!(continuation.assemble(b"tail".to_vec()).unwrap().is_none());
+        let new_first =
+            connection.recv_packet_unrestricted(PacketHeader::new(7, 11, 2, 0, 3, target()));
+        let assemblable = new_first.assemble(b"new".to_vec()).unwrap().unwrap();
+        let mut output = Vec::new();
+        let (address, assoc_id) = assemblable.assemble(&mut output);
+
+        assert_eq!(output, b"newtail");
+        assert_eq!(address, target());
+        assert_eq!(assoc_id, 7);
+    }
 }

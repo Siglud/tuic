@@ -8,6 +8,12 @@ use tokio::time;
 use tuic::Address;
 use tuic_quinn::{Connect, Packet};
 
+#[derive(Debug, Eq, PartialEq)]
+enum PacketRoute {
+    Native,
+    Quic,
+}
+
 impl Connection {
     pub async fn authenticate(self, zero_rtt_accepted: Option<ZeroRttAccepted>) {
         if let Some(zero_rtt_accepted) = zero_rtt_accepted {
@@ -43,8 +49,8 @@ impl Connection {
     pub async fn packet(&self, pkt: Bytes, addr: Address, assoc_id: u16) -> Result<(), Error> {
         let addr_display = addr.to_string();
 
-        match self.udp_relay_mode {
-            UdpRelayMode::Native => {
+        match packet_route(self.udp_relay_mode) {
+            PacketRoute::Native => {
                 log::info!("[relay] [packet] [{assoc_id:#06x}] [to-native] to {addr_display}");
                 match self.model.packet_native(pkt, addr, assoc_id) {
                     Ok(()) => Ok(()),
@@ -54,7 +60,7 @@ impl Connection {
                     }
                 }
             }
-            UdpRelayMode::Quic => {
+            PacketRoute::Quic => {
                 log::info!("[relay] [packet] [{assoc_id:#06x}] [to-quic] {addr_display}");
                 match self.model.packet_quic(pkt, addr, assoc_id).await {
                     Ok(()) => Ok(()),
@@ -121,13 +127,7 @@ impl Connection {
             Ok(Some((pkt, addr, _))) => {
                 log::info!("[relay] [packet] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] from {addr}");
 
-                let addr = match addr {
-                    Address::None => unreachable!(),
-                    Address::DomainAddress(domain, port) => {
-                        Socks5Address::DomainAddress(domain.into_bytes(), port)
-                    }
-                    Address::SocketAddress(addr) => Socks5Address::SocketAddress(addr),
-                };
+                let addr = to_socks5_address(addr).expect("packet address must not be empty");
 
                 let session = SOCKS5_UDP_SESSIONS
                     .get()
@@ -149,5 +149,48 @@ impl Connection {
             Ok(None) => {}
             Err(err) => log::warn!("[relay] [packet] [{assoc_id:#06x}] [from-native] [{pkt_id:#06x}] packet receiving error: {err}"),
         }
+    }
+}
+
+fn packet_route(mode: UdpRelayMode) -> PacketRoute {
+    match mode {
+        UdpRelayMode::Native => PacketRoute::Native,
+        UdpRelayMode::Quic => PacketRoute::Quic,
+    }
+}
+
+fn to_socks5_address(addr: Address) -> Option<Socks5Address> {
+    match addr {
+        Address::None => None,
+        Address::DomainAddress(domain, port) => {
+            Some(Socks5Address::DomainAddress(domain.into_bytes(), port))
+        }
+        Address::SocketAddress(addr) => Some(Socks5Address::SocketAddress(addr)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_packet_route_from_udp_mode() {
+        assert_eq!(packet_route(UdpRelayMode::Native), PacketRoute::Native);
+        assert_eq!(packet_route(UdpRelayMode::Quic), PacketRoute::Quic);
+    }
+
+    #[test]
+    fn converts_tuic_addresses_for_socks_udp_replies() {
+        assert_eq!(to_socks5_address(Address::None), None);
+        assert_eq!(
+            to_socks5_address(Address::DomainAddress("example.com".to_string(), 53)),
+            Some(Socks5Address::DomainAddress(b"example.com".to_vec(), 53))
+        );
+
+        let socket_addr = "192.0.2.20:5353".parse().unwrap();
+        assert_eq!(
+            to_socks5_address(Address::SocketAddress(socket_addr)),
+            Some(Socks5Address::SocketAddress(socket_addr))
+        );
     }
 }

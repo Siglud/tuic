@@ -5,7 +5,6 @@ use crate::{
 };
 use crossbeam_utils::atomic::AtomicCell;
 use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
 use quinn::{
     congestion::{BbrConfig, CubicConfig, NewRenoConfig},
     crypto::rustls::QuicClientConfig,
@@ -29,7 +28,7 @@ use uuid::Uuid;
 mod handle_stream;
 mod handle_task;
 
-static ENDPOINT: OnceCell<Mutex<Endpoint>> = OnceCell::new();
+static ENDPOINT: OnceCell<AsyncMutex<Endpoint>> = OnceCell::new();
 static CONNECTION: AsyncOnceCell<AsyncMutex<Connection>> = AsyncOnceCell::const_new();
 static TIMEOUT: AtomicCell<Duration> = AtomicCell::new(Duration::from_secs(0));
 
@@ -62,8 +61,7 @@ impl Connection {
         crypto.enable_sni = !cfg.disable_sni;
 
         let mut config = ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+            QuicClientConfig::try_from(crypto).map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
         let mut tp_cfg = TransportConfig::default();
 
@@ -117,7 +115,7 @@ impl Connection {
         };
 
         ENDPOINT
-            .set(Mutex::new(ep))
+            .set(AsyncMutex::new(ep))
             .map_err(|_| "endpoint already initialized")
             .unwrap();
 
@@ -128,13 +126,8 @@ impl Connection {
 
     pub async fn get() -> Result<Connection, Error> {
         let try_init_conn = async {
-            ENDPOINT
-                .get()
-                .unwrap()
-                .lock()
-                .connect()
-                .await
-                .map(AsyncMutex::new)
+            let mut endpoint = ENDPOINT.get().unwrap().lock().await;
+            endpoint.connect().await.map(AsyncMutex::new)
         };
 
         let try_get_conn = async {
@@ -145,7 +138,8 @@ impl Connection {
                 .await;
 
             if conn.is_closed() {
-                let new_conn = ENDPOINT.get().unwrap().lock().connect().await?;
+                let mut endpoint = ENDPOINT.get().unwrap().lock().await;
+                let new_conn = endpoint.connect().await?;
                 *conn = new_conn;
             }
 
@@ -259,20 +253,13 @@ impl Endpoint {
 
         for addr in self.server.resolve().await? {
             let connect_to = async {
-                let match_ipv4 =
-                    addr.is_ipv4() && self.ep.local_addr().map_or(false, |addr| addr.is_ipv4());
-                let match_ipv6 =
-                    addr.is_ipv6() && self.ep.local_addr().map_or(false, |addr| addr.is_ipv6());
-
-                if !match_ipv4 && !match_ipv6 {
-                    let bind_addr = if addr.is_ipv4() {
-                        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-                    } else {
-                        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-                    };
-
+                if !self
+                    .ep
+                    .local_addr()
+                    .is_ok_and(|local_addr| same_address_family(addr, local_addr))
+                {
                     self.ep
-                        .rebind(UdpSocket::bind(bind_addr).map_err(|err| {
+                        .rebind(UdpSocket::bind(wildcard_addr_for(addr)).map_err(|err| {
                             Error::Socket("failed to create endpoint UDP socket", err)
                         })?)
                         .map_err(|err| {
@@ -311,5 +298,47 @@ impl Endpoint {
         }
 
         Err(last_err.unwrap_or(Error::DnsResolve))
+    }
+}
+
+fn same_address_family(left: SocketAddr, right: SocketAddr) -> bool {
+    left.is_ipv4() == right.is_ipv4()
+}
+
+fn wildcard_addr_for(remote: SocketAddr) -> SocketAddr {
+    if remote.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_family_helpers_select_matching_wildcard_bindings() {
+        let ipv4 = SocketAddr::from(([192, 0, 2, 1], 443));
+        let ipv4_local = SocketAddr::from(([0, 0, 0, 0], 12345));
+        let ipv6 = "[2001:db8::1]:443".parse().unwrap();
+        let ipv6_local = "[::]:12345".parse().unwrap();
+
+        assert!(same_address_family(ipv4, ipv4_local));
+        assert!(same_address_family(ipv6, ipv6_local));
+        assert!(!same_address_family(ipv4, ipv6_local));
+        assert_eq!(
+            wildcard_addr_for(ipv4),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        );
+        assert_eq!(
+            wildcard_addr_for(ipv6),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        );
+    }
+
+    #[test]
+    fn default_remote_stream_capacity_is_nonzero() {
+        assert_eq!(DEFAULT_CONCURRENT_STREAMS, 32);
     }
 }

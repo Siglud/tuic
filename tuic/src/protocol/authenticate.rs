@@ -54,3 +54,24 @@ impl From<Authenticate> for (Uuid, [u8; 32]) {
         (auth.uuid, auth.token)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_accessors_type_len_and_conversion() {
+        let uuid = Uuid::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let token = [0xa5; 32];
+        let authenticate = Authenticate::new(uuid, token);
+
+        assert_eq!(authenticate.uuid(), uuid);
+        assert_eq!(authenticate.token(), token);
+        assert_eq!(Authenticate::type_code(), 0x00);
+        assert_eq!(authenticate.len(), 48);
+
+        let (converted_uuid, converted_token) = authenticate.into();
+        assert_eq!(converted_uuid, uuid);
+        assert_eq!(converted_token, token);
+    }
+}

@@ -35,6 +35,21 @@ There are 4 crates provided in this repository:
 - **[tuic-server](https://github.com/EAimTY/tuic/tree/dev/tuic-server)** - Binary. Minimalistic TUIC server implementation as a reference
 - **[tuic-client](https://github.com/EAimTY/tuic/tree/dev/tuic-client)** - Binary. Minimalistic TUIC client implementation as a reference
 
+## Testing
+
+Run the workspace unit tests with all features enabled:
+
+```bash
+cargo test --workspace --all-features --locked
+```
+
+The end-to-end suite generates temporary TLS material, starts the real client and server binaries, and exercises TCP and UDP relaying over localhost:
+
+```bash
+cargo build --workspace --bins --locked
+cargo test -p tuic-server --test proxy_e2e --locked -- --ignored --nocapture --test-threads=1
+```
+
 ## License
 
 Code in this repository is licensed under [GNU General Public License v3.0](https://github.com/EAimTY/tuic/blob/dev/LICENSE)
