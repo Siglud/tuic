@@ -4,10 +4,14 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      RELEASE_TAG:
+        description: Existing release tag to upload binaries to
+        required: false
+        type: string
 
 jobs:
   release-tuic-client:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'tuic-client-')
     permissions:
       contents: write
 
