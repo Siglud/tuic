@@ -140,6 +140,13 @@ jobs:
           if ($null -eq $package) {
             throw 'Package ${{ inputs.PACKAGE_NAME }} was not found'
           }
+          if ('${{ github.event_name }}' -eq 'release') {
+            $expectedTag = '${{ inputs.PACKAGE_NAME }}-' + $package.version
+            $actualTag = '${{ github.event.release.tag_name }}'
+            if ($actualTag -ne $expectedTag) {
+              throw "Release tag '$actualTag' does not match package version '$expectedTag'"
+            }
+          }
           "version=$($package.version)" >> $env:GITHUB_OUTPUT
           "prerelease=$($package.version.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
@@ -167,12 +174,15 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
           "$hash  $name" | Set-Content -NoNewline "$path.sha256sum"
 
-      - name: Release binaries
+      - name: Upload binaries to release
         uses: ncipollo/release-action@v1.21.0
         with:
           artifacts: "artifacts/*"
-          name: ${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}
-          tag: ${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}
+          name: ${{ github.event.release.name || format('{0}-{1}', inputs.PACKAGE_NAME, steps.package.outputs.version) }}
+          tag: ${{ github.event.release.tag_name || format('{0}-{1}', inputs.PACKAGE_NAME, steps.package.outputs.version) }}
           commit: ${{ github.sha }}
           allowUpdates: true
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
           prerelease: ${{ steps.package.outputs.prerelease }}
