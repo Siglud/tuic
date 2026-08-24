@@ -12,9 +12,11 @@ on:
 
 jobs:
   release-tuic-server:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'tuic-server-')
     permissions:
       contents: write
 
     uses: ./.github/workflows/binary-release.yml
     with:
       PACKAGE_NAME: "tuic-server"
+      RELEASE_TAG: ${{ github.event.inputs.RELEASE_TAG || '' }}

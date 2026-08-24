@@ -6,6 +6,9 @@ on:
       PACKAGE_NAME:
         required: true
         type: string
+      RELEASE_TAG:
+        required: false
+        type: string
 
 jobs:
   binary-release:
@@ -119,7 +122,7 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.release.tag_name || github.event.inputs.RELEASE_TAG || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.RELEASE_TAG || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -141,9 +144,9 @@ jobs:
           if ($null -eq $package) {
             throw 'Package ${{ inputs.PACKAGE_NAME }} was not found'
           }
-          $releaseTag = '${{ github.event.release.tag_name || github.event.inputs.RELEASE_TAG }}'
+          $releaseTag = '${{ github.event.release.tag_name || inputs.RELEASE_TAG }}'
           if ($releaseTag) {
-            $expectedTag = 'v' + $package.version
+            $expectedTag = '${{ inputs.PACKAGE_NAME }}-' + $package.version
             if ($releaseTag -ne $expectedTag) {
               throw "Release tag '$releaseTag' does not match package version '$expectedTag'"
             }
@@ -180,7 +183,7 @@ jobs:
         with:
           artifacts: "artifacts/*"
           name: ${{ github.event.release.name || format('{0}-{1}', inputs.PACKAGE_NAME, steps.package.outputs.version) }}
-          tag: ${{ github.event.release.tag_name || github.event.inputs.RELEASE_TAG || format('{0}-{1}', inputs.PACKAGE_NAME, steps.package.outputs.version) }}
+          tag: ${{ github.event.release.tag_name || inputs.RELEASE_TAG || format('{0}-{1}', inputs.PACKAGE_NAME, steps.package.outputs.version) }}
           commit: ${{ github.sha }}
           allowUpdates: true
           omitBodyDuringUpdate: true
