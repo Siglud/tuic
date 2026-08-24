@@ -1,23 +1,23 @@
 use super::{udp_session::UdpSession, Server, UDP_SESSIONS};
 use crate::connection::{Connection as TuicConnection, ERROR_CODE};
-use socks5_proto::{Address, Reply};
-use socks5_server::{
-    connection::{associate, bind, connect},
-    Associate, Bind, Connect,
+use socks5_proto::{Address, Reply, Response};
+use std::net::SocketAddr;
+use tokio::{
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
 };
-use tokio::io::{self, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tuic::Address as TuicAddress;
 
 impl Server {
     pub async fn handle_associate(
-        assoc: Associate<associate::state::NeedReply>,
+        mut stream: TcpStream,
+        peer_addr: SocketAddr,
         assoc_id: u16,
         dual_stack: Option<bool>,
         max_pkt_size: usize,
     ) {
-        let peer_addr = assoc.peer_addr().unwrap();
-        let local_ip = assoc.local_addr().unwrap().ip();
+        let local_ip = stream.local_addr().unwrap().ip();
 
         match UdpSession::new(assoc_id, peer_addr, local_ip, dual_stack, max_pkt_size) {
             Ok(session) => {
@@ -26,16 +26,11 @@ impl Server {
                     "[socks5] [{peer_addr}] [associate] [{assoc_id:#06x}] bound to {local_addr}"
                 );
 
-                let mut assoc = match assoc
-                    .reply(Reply::Succeeded, Address::SocketAddress(local_addr))
-                    .await
-                {
-                    Ok(assoc) => assoc,
-                    Err((err, _)) => {
-                        log::warn!("[socks5] [{peer_addr}] [associate] [{assoc_id:#06x}] command reply error: {err}");
-                        return;
-                    }
-                };
+                let resp =
+                    Response::new(Reply::Succeeded, Address::SocketAddress(local_addr));
+                if resp.write_to(&mut stream).await.is_err() {
+                    return;
+                }
 
                 UDP_SESSIONS
                     .get()
@@ -81,8 +76,19 @@ impl Server {
                     }
                 };
 
+                // Wait for the TCP control connection to close
+                let wait_close = async {
+                    loop {
+                        match stream.read(&mut [0]).await {
+                            Ok(0) => break Ok(()),
+                            Ok(_) => {}
+                            Err(err) => break Err(err),
+                        }
+                    }
+                };
+
                 match tokio::select! {
-                    res = assoc.wait_close() => res,
+                    res = wait_close => res,
                     _ = handle_local_incoming_pkt => unreachable!(),
                 } {
                     Ok(()) => {}
@@ -115,45 +121,25 @@ impl Server {
             Err(err) => {
                 log::warn!("[socks5] [{peer_addr}] [associate] [{assoc_id:#06x}] failed setting up UDP associate session: {err}");
 
-                match assoc
-                    .reply(Reply::GeneralFailure, Address::unspecified())
-                    .await
-                {
-                    Ok(mut assoc) => {
-                        let _ = assoc.close().await;
-                    }
-                    Err((err, _)) => {
-                        log::warn!("[socks5] [{peer_addr}] [associate] [{assoc_id:#06x}] command reply error: {err}")
-                    }
-                }
+                let resp = Response::new(Reply::GeneralFailure, Address::unspecified());
+                let _ = resp.write_to(&mut stream).await;
             }
         }
     }
 
-    pub async fn handle_bind(bind: Bind<bind::state::NeedFirstReply>) {
-        let peer_addr = bind.peer_addr().unwrap();
+    pub async fn handle_bind(mut stream: TcpStream, peer_addr: SocketAddr) {
         log::warn!("[socks5] [{peer_addr}] [bind] command not supported");
 
-        match bind
-            .reply(Reply::CommandNotSupported, Address::unspecified())
-            .await
-        {
-            Ok(mut bind) => {
-                let _ = bind.close().await;
-            }
-            Err((err, _)) => log::warn!("[socks5] [{peer_addr}] [bind] command reply error: {err}"),
-        }
+        let resp = Response::new(Reply::CommandNotSupported, Address::unspecified());
+        let _ = resp.write_to(&mut stream).await;
     }
 
-    pub async fn handle_connect(conn: Connect<connect::state::NeedReply>, addr: Address) {
-        let peer_addr = conn.peer_addr().unwrap();
+    pub async fn handle_connect(mut stream: TcpStream, peer_addr: SocketAddr, addr: Address) {
         let target_addr = match addr {
-            Address::DomainAddress(domain, port) => {
-                TuicAddress::DomainAddress(
-                    String::from_utf8_lossy(&domain).into_owned(),
-                    port,
-                )
-            }
+            Address::DomainAddress(domain, port) => TuicAddress::DomainAddress(
+                String::from_utf8_lossy(&domain).into_owned(),
+                port,
+            ),
             Address::SocketAddress(addr) => TuicAddress::SocketAddress(addr),
         };
 
@@ -166,16 +152,17 @@ impl Server {
             Ok(relay) => {
                 let mut relay = relay.compat();
 
-                match conn.reply(Reply::Succeeded, Address::unspecified()).await {
-                    Ok(mut conn) => match io::copy_bidirectional(&mut conn, &mut relay).await {
+                let resp = Response::new(Reply::Succeeded, Address::unspecified());
+                match resp.write_to(&mut stream).await {
+                    Ok(()) => match io::copy_bidirectional(&mut stream, &mut relay).await {
                         Ok(_) => {}
                         Err(err) => {
-                            let _ = conn.shutdown().await;
+                            let _ = stream.shutdown().await;
                             let _ = relay.get_mut().reset(ERROR_CODE);
                             log::warn!("[socks5] [{peer_addr}] [connect] [{target_addr}] TCP stream relaying error: {err}");
                         }
                     },
-                    Err((err, _)) => {
+                    Err(err) => {
                         let _ = relay.shutdown().await;
                         log::warn!("[socks5] [{peer_addr}] [connect] [{target_addr}] command reply error: {err}");
                     }
@@ -184,17 +171,8 @@ impl Server {
             Err(err) => {
                 log::warn!("[socks5] [{peer_addr}] [connect] [{target_addr}] unable to relay TCP stream: {err}");
 
-                match conn
-                    .reply(Reply::GeneralFailure, Address::unspecified())
-                    .await
-                {
-                    Ok(mut conn) => {
-                        let _ = conn.close().await;
-                    }
-                    Err((err, _)) => {
-                        log::warn!("[socks5] [{peer_addr}] [connect] [{target_addr}] command reply error: {err}")
-                    }
-                }
+                let resp = Response::new(Reply::GeneralFailure, Address::unspecified());
+                let _ = resp.write_to(&mut stream).await;
             }
         }
     }

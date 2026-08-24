@@ -112,22 +112,33 @@ tuic-client -c PATH/TO/CONFIG
         "gc_lifetime": "15s"
     },
 
-    // Settings for the local inbound socks5 server
+    // Settings for the local proxy server
     "local": {
-        // Local socks5 server address
+        // Local proxy server address
+        // Both SOCKS5 and HTTP proxy listen on this single port when "enable_http" is true
         "server": "[::]:1080",
 
-        // Optional. Set the username for socks5 authentication
+        // Optional. Set the username for proxy authentication
+        // Applies to both SOCKS5 (password auth) and HTTP (Proxy-Authorization: Basic)
         "username": "USERNAME",
 
-        // Optional. Set the password for socks5 authentication
+        // Optional. Set the password for proxy authentication
+        // Applies to both SOCKS5 (password auth) and HTTP (Proxy-Authorization: Basic)
         "password": "PASSWORD",
-        
-        // Optional. Set if the listening socket should be dual-stack
+
+        // Optional. Enable HTTP proxy on the same port as SOCKS5
+        // When enabled, the server automatically detects whether each incoming connection
+        // is a SOCKS5 connection (first byte 0x05) or an HTTP proxy request, and handles
+        // it accordingly. Both protocols share the same username/password credentials.
+        // Default: false
+        "enable_http": false,
+
+        // Optional. Set if the listening socket should be dual-stack (e.g. an IPv6
+        // listening address also accepts IPv4 connections when supported by the OS)
         // If this option is not set, the socket behavior is platform dependent
         "dual_stack": true,
-
-        // Optional. Maximum packet size the socks5 server can receive from external, in bytes
+        // Optional. Maximum packet size the SOCKS5 server can receive from external, in bytes
+        // Note: ignored for HTTP proxy connections
         // Default: 1500
         "max_packet_size": 1500
     },
