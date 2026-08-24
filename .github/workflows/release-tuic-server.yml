@@ -1,7 +1,14 @@
 name: release-tuic-server
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      RELEASE_TAG:
+        description: Existing release tag to upload binaries to
+        required: false
+        type: string
 
 jobs:
   release-tuic-server:
