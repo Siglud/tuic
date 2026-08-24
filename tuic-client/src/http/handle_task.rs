@@ -1,3 +1,4 @@
+use super::write_http_response;
 use crate::connection::{Connection as TuicConnection, ERROR_CODE};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tokio::{
@@ -15,9 +16,11 @@ pub async fn handle_connect(mut stream: TcpStream, peer_addr: SocketAddr, target
     let (host, port) = match parse_host_port(target) {
         Some(hp) => hp,
         None => {
-            let _ = stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
             return;
         }
     };
@@ -33,8 +36,7 @@ pub async fn handle_connect(mut stream: TcpStream, peer_addr: SocketAddr, target
         Ok(relay) => {
             let mut relay = relay.compat();
 
-            if stream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            if write_http_response(&mut stream, b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .is_err()
             {
@@ -55,9 +57,11 @@ pub async fn handle_connect(mut stream: TcpStream, peer_addr: SocketAddr, target
         }
         Err(err) => {
             log::warn!("[http] [{peer_addr}] [connect] [{tuic_addr}] unable to relay: {err}");
-            let _ = stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
         }
     }
 }
@@ -78,9 +82,11 @@ pub async fn handle_request(
     let (host, port, path) = match parse_http_url(url) {
         Some(hp) => hp,
         None => {
-            let _ = stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
             return;
         }
     };
@@ -103,9 +109,11 @@ pub async fn handle_request(
             let request_buf = format_request(method, &path, version, headers);
 
             if relay.write_all(request_buf.as_bytes()).await.is_err() {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                    .await;
+                let _ = write_http_response(
+                    &mut stream,
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
                 return;
             }
 
@@ -122,9 +130,11 @@ pub async fn handle_request(
         }
         Err(err) => {
             log::warn!("[http] [{peer_addr}] [request] [{tuic_addr}] unable to relay: {err}");
-            let _ = stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
         }
     }
 }
