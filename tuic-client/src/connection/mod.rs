@@ -66,6 +66,7 @@ impl Connection {
         let mut tp_cfg = TransportConfig::default();
 
         tp_cfg
+            .packet_threshold(300)
             .max_concurrent_bidi_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
             .max_concurrent_uni_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
             .send_window(cfg.send_window)
