@@ -67,7 +67,7 @@ jobs:
           - arch-name: i686-pc-windows-msvc
             os: windows-latest
             target: i686-pc-windows-msvc
-            cross: true
+            cross: false
             file-ext: .exe
 
           - arch-name: aarch64-unknown-linux-gnu
@@ -85,7 +85,7 @@ jobs:
           - arch-name: aarch64-apple-darwin
             os: macos-latest
             target: aarch64-apple-darwin
-            cross: true
+            cross: false
             file-ext:
 
           - arch-name: armv7-unknown-linux-gnueabi
@@ -116,52 +116,63 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
-          target: ${{ matrix.target }}
-          override: true
+          targets: ${{ matrix.target }}
 
-      - name: Get package version on Unix-like system
-        if: runner.os != 'Windows'
-        run: |
-          echo "version=$(sed -rn 's/^version = \"(.*)\"/\1/p' ${{ inputs.PACKAGE_NAME }}/Cargo.toml)" >> $GITHUB_ENV
-          echo "prerelease=$((sed -rn 's/^version = \"(.*)\"/\1/p' ${{ inputs.PACKAGE_NAME }}/Cargo.toml | grep -qF '-') && echo "true" || echo "false")" >> $GITHUB_ENV
-
-      - name: Get package version on Windows
-        if: runner.os == 'Windows'
-        run: |
-          echo "version=$(Get-Content ${{ inputs.PACKAGE_NAME }}/Cargo.toml | Select-String -Pattern '^version = \"(.*)\"' | ForEach-Object { $_.Matches.Groups[1].Value })" >> $env:GITHUB_ENV
-          echo "prerelease=$((Get-Content ${{ inputs.PACKAGE_NAME }}/Cargo.toml | Select-String -Pattern '^version = \"(.*)\"' | ForEach-Object { $_.Matches.Groups[1].Value } | Select-String -Quiet '-') && echo "false" || echo "true")" >> $env:GITHUB_ENV
-
-      - name: Build
-        uses: actions-rs/cargo@v1
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2.86.6
         with:
-          use-cross: ${{ matrix.cross }}
-          command: build
-          args: --release -p ${{ inputs.PACKAGE_NAME }} --target ${{ matrix.target }}
+          tool: cross
+
+      - name: Get package metadata
+        id: package
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq '${{ inputs.PACKAGE_NAME }}' }
+          if ($null -eq $package) {
+            throw 'Package ${{ inputs.PACKAGE_NAME }} was not found'
+          }
+          "version=$($package.version)" >> $env:GITHUB_OUTPUT
+          "prerelease=$($package.version.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Build with cross
+        if: matrix.cross
+        run: cross build --locked --release -p ${{ inputs.PACKAGE_NAME }} --target ${{ matrix.target }}
+
+      - name: Build with Cargo
+        if: ${{ !matrix.cross }}
+        run: cargo build --locked --release -p ${{ inputs.PACKAGE_NAME }} --target ${{ matrix.target }}
 
       - name: Move binaries
+        shell: pwsh
         run: |
-          mkdir artifacts/
-          mv target/${{ matrix.target }}/release/${{ inputs.PACKAGE_NAME }}${{ matrix.file-ext }} artifacts/${{ inputs.PACKAGE_NAME }}-${{ env.version }}-${{ matrix.arch-name }}${{ matrix.file-ext }}
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $source = 'target/${{ matrix.target }}/release/${{ inputs.PACKAGE_NAME }}${{ matrix.file-ext }}'
+          $destination = 'artifacts/${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}-${{ matrix.arch-name }}${{ matrix.file-ext }}'
+          Move-Item $source $destination
 
       - name: Calculate SHA256
+        shell: pwsh
         run: |
-          cd artifacts/
-          openssl dgst -sha256 -r ${{ inputs.PACKAGE_NAME }}-${{ env.version }}-${{ matrix.arch-name }}${{ matrix.file-ext }} > ${{ inputs.PACKAGE_NAME }}-${{ env.version }}-${{ matrix.arch-name }}${{ matrix.file-ext }}.sha256sum
+          $name = '${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}-${{ matrix.arch-name }}${{ matrix.file-ext }}'
+          $path = Join-Path artifacts $name
+          $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -NoNewline "$path.sha256sum"
 
       - name: Release binaries
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@v1.21.0
         with:
           artifacts: "artifacts/*"
-          name: ${{ inputs.PACKAGE_NAME }}-${{ env.version }}
-          tag: ${{ inputs.PACKAGE_NAME }}-${{ env.version }}
+          name: ${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}
+          tag: ${{ inputs.PACKAGE_NAME }}-${{ steps.package.outputs.version }}
           commit: ${{ github.sha }}
           allowUpdates: true
-          prerelease: ${{ env.prerelease }}
+          prerelease: ${{ steps.package.outputs.prerelease }}

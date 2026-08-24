@@ -20,19 +20,18 @@ pub struct UdpSession(Arc<UdpSessionInner>);
 struct UdpSessionInner {
     assoc_id: u16,
     conn: Connection,
-    socket_v4: UdpSocket,
-    socket_v6: Option<UdpSocket>,
-    max_pkt_size: usize,
+    sockets: UdpSockets,
     close: Mutex<Option<Sender<()>>>,
 }
 
-impl UdpSession {
-    pub fn new(
-        conn: Connection,
-        assoc_id: u16,
-        udp_relay_ipv6: bool,
-        max_pkt_size: usize,
-    ) -> Result<Self, Error> {
+struct UdpSockets {
+    socket_v4: UdpSocket,
+    socket_v6: Option<UdpSocket>,
+    max_pkt_size: usize,
+}
+
+impl UdpSockets {
+    fn new(udp_relay_ipv6: bool, max_pkt_size: usize) -> Result<Self, Error> {
         let socket_v4 = {
             let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
                 .map_err(|err| Error::Socket("failed to create UDP associate IPv4 socket", err))?;
@@ -81,14 +80,67 @@ impl UdpSession {
             None
         };
 
+        Ok(Self {
+            socket_v4,
+            socket_v6,
+            max_pkt_size,
+        })
+    }
+
+    async fn send(&self, pkt: Bytes, addr: SocketAddr) -> Result<(), Error> {
+        let socket = match addr {
+            SocketAddr::V4(_) => &self.socket_v4,
+            SocketAddr::V6(_) => self
+                .socket_v6
+                .as_ref()
+                .ok_or_else(|| Error::UdpRelayIpv6Disabled(addr))?,
+        };
+
+        socket.send_to(&pkt, addr).await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<(Bytes, SocketAddr), IoError> {
+        async fn recv(
+            socket: &UdpSocket,
+            max_pkt_size: usize,
+        ) -> Result<(Bytes, SocketAddr), IoError> {
+            #[cfg(windows)]
+            let receive_size = max_pkt_size.max(u16::MAX as usize);
+            #[cfg(not(windows))]
+            let receive_size = max_pkt_size;
+
+            let mut buf = vec![0u8; receive_size];
+            let (n, addr) = socket.recv_from(&mut buf).await?;
+            buf.truncate(n.min(max_pkt_size));
+            Ok((Bytes::from(buf), addr))
+        }
+
+        if let Some(socket_v6) = &self.socket_v6 {
+            tokio::select! {
+                res = recv(&self.socket_v4, self.max_pkt_size) => res,
+                res = recv(socket_v6, self.max_pkt_size) => res,
+            }
+        } else {
+            recv(&self.socket_v4, self.max_pkt_size).await
+        }
+    }
+}
+
+impl UdpSession {
+    pub fn new(
+        conn: Connection,
+        assoc_id: u16,
+        udp_relay_ipv6: bool,
+        max_pkt_size: usize,
+    ) -> Result<Self, Error> {
+        let sockets = UdpSockets::new(udp_relay_ipv6, max_pkt_size)?;
         let (tx, rx) = oneshot::channel();
 
         let session = Self(Arc::new(UdpSessionInner {
             conn,
             assoc_id,
-            socket_v4,
-            socket_v6,
-            max_pkt_size,
+            sockets,
             close: Mutex::new(Some(tx)),
         }));
 
@@ -127,41 +179,93 @@ impl UdpSession {
     }
 
     pub async fn send(&self, pkt: Bytes, addr: SocketAddr) -> Result<(), Error> {
-        let socket = match addr {
-            SocketAddr::V4(_) => &self.0.socket_v4,
-            SocketAddr::V6(_) => self
-                .0
-                .socket_v6
-                .as_ref()
-                .ok_or_else(|| Error::UdpRelayIpv6Disabled(addr))?,
-        };
-
-        socket.send_to(&pkt, addr).await?;
-        Ok(())
+        self.0.sockets.send(pkt, addr).await
     }
 
     async fn recv(&self) -> Result<(Bytes, SocketAddr), IoError> {
-        async fn recv(
-            socket: &UdpSocket,
-            max_pkt_size: usize,
-        ) -> Result<(Bytes, SocketAddr), IoError> {
-            let mut buf = vec![0u8; max_pkt_size];
-            let (n, addr) = socket.recv_from(&mut buf).await?;
-            buf.truncate(n);
-            Ok((Bytes::from(buf), addr))
-        }
-
-        if let Some(socket_v6) = &self.0.socket_v6 {
-            tokio::select! {
-                res = recv(&self.0.socket_v4, self.0.max_pkt_size) => res,
-                res = recv(socket_v6, self.0.max_pkt_size) => res,
-            }
-        } else {
-            recv(&self.0.socket_v4, self.0.max_pkt_size).await
-        }
+        self.0.sockets.recv().await
     }
 
     pub fn close(&self) {
-        let _ = self.0.close.lock().take().unwrap().send(());
+        signal_close(&self.0.close);
+    }
+}
+
+fn signal_close(close: &Mutex<Option<Sender<()>>>) {
+    if let Some(sender) = close.lock().take() {
+        let _ = sender.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio::time::{timeout, Duration};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        timeout(TEST_TIMEOUT, future)
+            .await
+            .expect("loopback UDP operation timed out")
+    }
+
+    #[tokio::test]
+    async fn sends_ipv4_datagram_to_loopback_socket() {
+        let sockets = UdpSockets::new(false, 1500).unwrap();
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        bounded(sockets.send(Bytes::from_static(b"outbound packet"), receiver_addr))
+            .await
+            .unwrap();
+        let mut buffer = [0; 64];
+        let (length, source) = bounded(receiver.recv_from(&mut buffer)).await.unwrap();
+
+        assert_eq!(&buffer[..length], b"outbound packet");
+        assert_eq!(
+            source.port(),
+            sockets.socket_v4.local_addr().unwrap().port()
+        );
+    }
+
+    #[tokio::test]
+    async fn receives_and_truncates_ipv4_datagram_to_configured_size() {
+        let sockets = UdpSockets::new(false, 4).unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            sockets.socket_v4.local_addr().unwrap().port(),
+        ));
+
+        bounded(sender.send_to(b"abcdefgh", target)).await.unwrap();
+        let (packet, source) = bounded(sockets.recv()).await.unwrap();
+
+        assert_eq!(packet.as_ref(), b"abcd");
+        assert_eq!(source, sender.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn disabled_ipv6_relay_rejects_ipv6_destination() {
+        let sockets = UdpSockets::new(false, 1500).unwrap();
+        let address = SocketAddr::from((Ipv6Addr::LOCALHOST, 43123));
+
+        assert!(matches!(
+            sockets.send(Bytes::from_static(b"packet"), address).await,
+            Err(Error::UdpRelayIpv6Disabled(rejected)) if rejected == address
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_signal_is_idempotent_and_cancels_waiter() {
+        let (sender, receiver) = oneshot::channel();
+        let close = Mutex::new(Some(sender));
+
+        signal_close(&close);
+        signal_close(&close);
+
+        bounded(receiver).await.unwrap();
+        assert!(close.lock().is_none());
     }
 }

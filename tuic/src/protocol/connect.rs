@@ -47,3 +47,21 @@ impl From<Connect> for (Address,) {
         (conn.addr,)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_accessors_type_len_and_conversion() {
+        let address = Address::DomainAddress("example.com".into(), 443);
+        let connect = Connect::new(address.clone());
+
+        assert_eq!(connect.addr(), &address);
+        assert_eq!(Connect::type_code(), 0x01);
+        assert_eq!(connect.len(), 15);
+
+        let (converted_address,) = connect.into();
+        assert_eq!(converted_address, address);
+    }
+}

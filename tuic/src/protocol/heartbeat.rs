@@ -29,6 +29,28 @@ impl Heartbeat {
     }
 }
 
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl From<Heartbeat> for () {
     fn from(_: Heartbeat) -> Self {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_type_len_and_conversion() {
+        let heartbeat = Heartbeat::new();
+
+        assert_eq!(Heartbeat::type_code(), 0x04);
+        assert_eq!(heartbeat.len(), 0);
+
+        let unit: () = heartbeat.into();
+        assert_eq!(unit, ());
+    }
 }

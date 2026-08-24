@@ -46,3 +46,20 @@ impl From<Dissociate> for (u16,) {
         (dissoc.assoc_id,)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_accessors_type_len_and_conversion() {
+        let dissociate = Dissociate::new(0x1234);
+
+        assert_eq!(dissociate.assoc_id(), 0x1234);
+        assert_eq!(Dissociate::type_code(), 0x03);
+        assert_eq!(dissociate.len(), 2);
+
+        let (assoc_id,) = dissociate.into();
+        assert_eq!(assoc_id, 0x1234);
+    }
+}

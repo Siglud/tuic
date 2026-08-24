@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Check feature isolation
+        run: |
+          cargo check -p tuic --lib --no-default-features --locked
+          cargo check -p tuic --lib --no-default-features --features marshal --locked
+          cargo check -p tuic --lib --no-default-features --features async_marshal --locked
+          cargo check -p tuic --lib --no-default-features --features model --locked
+
+  e2e:
+    name: End-to-end (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Build workspace binaries
+        run: cargo build --workspace --bins --locked
+
+      - name: Run client/server end-to-end tests
+        run: cargo test -p tuic-server --test proxy_e2e --locked -- --ignored --nocapture --test-threads=1
+        env:
+          RUST_BACKTRACE: 1

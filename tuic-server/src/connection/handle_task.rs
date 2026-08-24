@@ -139,7 +139,10 @@ impl Connection {
             };
 
             let Some(socket_addr) = resolve_dns(&addr).await?.next() else {
-                return Err(Error::from(IoError::new(ErrorKind::NotFound, "no address resolved")));
+                return Err(Error::from(IoError::new(
+                    ErrorKind::NotFound,
+                    "no address resolved",
+                )));
             };
 
             session.send(pkt, socket_addr).await
@@ -216,5 +219,60 @@ async fn resolve_dns(addr: &Address) -> Result<impl Iterator<Item = SocketAddr>,
             .collect::<Vec<_>>()
             .into_iter()),
         Address::SocketAddress(addr) => Ok(vec![*addr].into_iter()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use tokio::time::{timeout, Duration};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn resolve_dns_rejects_empty_address() {
+        let error = resolve_dns(&Address::None).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "empty address");
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_preserves_socket_address() {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 43123));
+        let resolved = resolve_dns(&Address::SocketAddress(address))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolved, [address]);
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_resolves_localhost_without_external_network() {
+        let resolved = timeout(
+            TEST_TIMEOUT,
+            resolve_dns(&Address::DomainAddress("localhost".into(), 43123)),
+        )
+        .await
+        .expect("localhost lookup timed out")
+        .unwrap()
+        .collect::<Vec<_>>();
+
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|address| address.ip().is_loopback()));
+        assert!(resolved.iter().all(|address| address.port() == 43123));
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_reports_invalid_domain() {
+        let result = timeout(
+            TEST_TIMEOUT,
+            resolve_dns(&Address::DomainAddress("invalid\0domain".into(), 443)),
+        )
+        .await
+        .expect("invalid domain lookup timed out");
+
+        assert!(result.is_err());
     }
 }

@@ -103,3 +103,25 @@ impl From<Packet> for (u16, u16, u8, u8, u16, Address) {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_accessors_type_len_and_conversion() {
+        let packet = Packet::new(0x1234, 0x5678, 2, 1, 3, Address::None);
+
+        assert_eq!(packet.assoc_id(), 0x1234);
+        assert_eq!(packet.pkt_id(), 0x5678);
+        assert_eq!(packet.frag_total(), 2);
+        assert_eq!(packet.frag_id(), 1);
+        assert_eq!(packet.size(), 3);
+        assert!(packet.addr().is_none());
+        assert_eq!(Packet::type_code(), 0x02);
+        assert_eq!(packet.len(), 9);
+
+        let fields: (u16, u16, u8, u8, u16, Address) = packet.into();
+        assert_eq!(fields, (0x1234, 0x5678, 2, 1, 3, Address::None));
+    }
+}

@@ -143,7 +143,7 @@ impl Server {
         }
     }
 
-    async fn dispatch_connection(&'static self, stream: TcpStream, addr: SocketAddr) {
+    async fn dispatch_connection(&self, stream: TcpStream, addr: SocketAddr) {
         if self.enable_http {
             let mut first_byte = [0u8; 1];
             match stream.peek(&mut first_byte).await {
@@ -268,5 +268,155 @@ impl Server {
         }
 
         log::debug!("[socks5] [{addr}] connection closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socks5_proto::handshake::{
+        password::Response as PasswordResponse, Response as HandshakeResponse,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::{timeout, Duration},
+    };
+
+    fn test_server(
+        username: Option<Vec<u8>>,
+        password: Option<Vec<u8>>,
+        enable_http: bool,
+    ) -> Result<Server, Error> {
+        Server::new(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            1500,
+            username,
+            password,
+            enable_http,
+        )
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+        (accepted.unwrap().0, connected.unwrap())
+    }
+
+    #[tokio::test]
+    async fn new_binds_ephemeral_ipv4_and_validates_auth_pairs() {
+        let server = test_server(None, None, false).unwrap();
+        let addr = server.listener.local_addr().unwrap();
+        assert!(addr.is_ipv4());
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0);
+
+        assert!(test_server(Some(b"user".to_vec()), Some(b"pass".to_vec()), false).is_ok());
+        assert!(matches!(
+            test_server(Some(b"user".to_vec()), None, false),
+            Err(Error::InvalidSocks5Auth)
+        ));
+        assert!(matches!(
+            test_server(None, Some(b"pass".to_vec()), false),
+            Err(Error::InvalidSocks5Auth)
+        ));
+    }
+
+    #[tokio::test]
+    async fn negotiates_no_auth_over_loopback() {
+        let server = test_server(None, None, false).unwrap();
+        let (server_stream, mut client_stream) = tcp_pair().await;
+        let peer_addr = server_stream.peer_addr().unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            let server_side = server.handle_socks5(server_stream, peer_addr);
+            let client_side = async {
+                client_stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let response = HandshakeResponse::read_from(&mut client_stream)
+                    .await
+                    .unwrap();
+                assert_eq!(response.method, Method::NONE);
+                client_stream.shutdown().await.unwrap();
+            };
+            tokio::join!(server_side, client_side);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn password_negotiation_accepts_and_rejects_credentials() {
+        for (password, expected) in [(b"pass".as_slice(), true), (b"wrong".as_slice(), false)] {
+            let server =
+                test_server(Some(b"user".to_vec()), Some(b"pass".to_vec()), false).unwrap();
+            let (server_stream, mut client_stream) = tcp_pair().await;
+            let peer_addr = server_stream.peer_addr().unwrap();
+
+            timeout(Duration::from_secs(2), async {
+                let server_side = server.handle_socks5(server_stream, peer_addr);
+                let client_side = async {
+                    client_stream.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+                    let response = HandshakeResponse::read_from(&mut client_stream)
+                        .await
+                        .unwrap();
+                    assert_eq!(response.method, Method::PASSWORD);
+
+                    let mut request = vec![0x01, 0x04];
+                    request.extend_from_slice(b"user");
+                    request.push(password.len() as u8);
+                    request.extend_from_slice(password);
+                    client_stream.write_all(&request).await.unwrap();
+                    let response = PasswordResponse::read_from(&mut client_stream)
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status, expected);
+                    client_stream.shutdown().await.unwrap();
+                };
+                tokio::join!(server_side, client_side);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatches_socks_and_http_by_first_byte() {
+        let server = test_server(None, None, true).unwrap();
+
+        let (server_stream, mut client_stream) = tcp_pair().await;
+        let peer_addr = server_stream.peer_addr().unwrap();
+        timeout(Duration::from_secs(2), async {
+            let server_side = server.dispatch_connection(server_stream, peer_addr);
+            let client_side = async {
+                client_stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let response = HandshakeResponse::read_from(&mut client_stream)
+                    .await
+                    .unwrap();
+                assert_eq!(response.method, Method::NONE);
+                client_stream.shutdown().await.unwrap();
+            };
+            tokio::join!(server_side, client_side);
+        })
+        .await
+        .unwrap();
+
+        let (server_stream, mut client_stream) = tcp_pair().await;
+        let peer_addr = server_stream.peer_addr().unwrap();
+        timeout(Duration::from_secs(2), async {
+            let server_side = server.dispatch_connection(server_stream, peer_addr);
+            let client_side = async {
+                client_stream
+                    .write_all(b"GET relative HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut response = Vec::new();
+                client_stream.read_to_end(&mut response).await.unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+            };
+            tokio::join!(server_side, client_side);
+        })
+        .await
+        .unwrap();
     }
 }

@@ -45,8 +45,7 @@ impl Server {
         crypto.send_half_rtt_data = cfg.zero_rtt_handshake;
 
         let mut config = ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(crypto)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+            QuicServerConfig::try_from(crypto).map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
         let mut tp_cfg = TransportConfig::default();
 
@@ -82,10 +81,12 @@ impl Server {
             let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
                 .map_err(|err| Error::Socket("failed to create endpoint UDP socket", err))?;
 
-            if let Some(dual_stack) = cfg.dual_stack {
-                socket.set_only_v6(!dual_stack).map_err(|err| {
-                    Error::Socket("endpoint dual-stack socket setting error", err)
-                })?;
+            if cfg.server.is_ipv6() {
+                if let Some(dual_stack) = cfg.dual_stack {
+                    socket.set_only_v6(!dual_stack).map_err(|err| {
+                        Error::Socket("endpoint dual-stack socket setting error", err)
+                    })?;
+                }
             }
 
             socket
@@ -146,5 +147,150 @@ impl Server {
                 self.gc_lifetime,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::LevelFilter;
+    use rcgen::generate_simple_self_signed;
+    use std::{fs, io::ErrorKind, net::Ipv4Addr, path::PathBuf};
+    use tempfile::{tempdir, TempDir};
+
+    const UUID: Uuid = Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff);
+
+    struct TlsFiles {
+        _dir: TempDir,
+        certificate: PathBuf,
+        private_key: PathBuf,
+    }
+
+    impl TlsFiles {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let certificate = dir.path().join("certificate.pem");
+            let private_key = dir.path().join("private-key.pem");
+            let certified = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            fs::write(&certificate, certified.cert.pem()).unwrap();
+            fs::write(&private_key, certified.signing_key.serialize_pem()).unwrap();
+
+            Self {
+                _dir: dir,
+                certificate,
+                private_key,
+            }
+        }
+
+        fn config(&self, congestion_control: CongestionControl) -> Config {
+            let mut users = HashMap::new();
+            users.insert(UUID, Box::from(b"test-password".as_slice()));
+
+            Config {
+                server: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                users,
+                certificate: self.certificate.clone(),
+                private_key: self.private_key.clone(),
+                congestion_control,
+                alpn: vec![b"tuic-test".to_vec()],
+                udp_relay_ipv6: false,
+                zero_rtt_handshake: true,
+                dual_stack: None,
+                auth_timeout: Duration::from_secs(7),
+                task_negotiation_timeout: Duration::from_secs(11),
+                max_idle_time: Duration::from_secs(13),
+                max_external_packet_size: 2048,
+                send_window: 2 * 1024 * 1024,
+                receive_window: 1024 * 1024,
+                gc_interval: Duration::from_secs(17),
+                gc_lifetime: Duration::from_secs(19),
+                log_level: LevelFilter::Trace,
+            }
+        }
+    }
+
+    fn init_error(config: Config) -> Error {
+        match Server::init(config) {
+            Ok(_) => panic!("server initialization unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn init_binds_ephemeral_loopback_and_retains_runtime_settings() {
+        let tls = TlsFiles::new();
+        let server = Server::init(tls.config(CongestionControl::Cubic)).unwrap();
+        let local_addr = server.ep.local_addr().unwrap();
+
+        assert!(local_addr.ip().is_loopback());
+        assert_ne!(local_addr.port(), 0);
+        assert_eq!(server.users.len(), 1);
+        assert_eq!(server.users[&UUID].as_ref(), b"test-password");
+        assert!(!server.udp_relay_ipv6);
+        assert!(server.zero_rtt_handshake);
+        assert_eq!(server.auth_timeout, Duration::from_secs(7));
+        assert_eq!(server.task_negotiation_timeout, Duration::from_secs(11));
+        assert_eq!(server.max_external_pkt_size, 2048);
+        assert_eq!(server.gc_interval, Duration::from_secs(17));
+        assert_eq!(server.gc_lifetime, Duration::from_secs(19));
+    }
+
+    #[tokio::test]
+    async fn init_supports_every_congestion_controller() {
+        let tls = TlsFiles::new();
+
+        for congestion_control in [
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+            CongestionControl::Bbr,
+        ] {
+            let server = Server::init(tls.config(congestion_control)).unwrap();
+            assert!(server.ep.local_addr().unwrap().ip().is_loopback());
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv4_bind_ignores_ipv6_only_dual_stack_setting() {
+        let tls = TlsFiles::new();
+
+        for dual_stack in [false, true] {
+            let mut config = tls.config(CongestionControl::Cubic);
+            config.dual_stack = Some(dual_stack);
+            let server = Server::init(config).unwrap();
+            assert!(server.ep.local_addr().unwrap().is_ipv4());
+        }
+    }
+
+    #[tokio::test]
+    async fn init_rejects_invalid_and_mismatched_tls_material() {
+        let tls = TlsFiles::new();
+        let invalid_certificate = tls._dir.path().join("invalid-certificate.pem");
+        fs::write(
+            &invalid_certificate,
+            b"-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let mut invalid = tls.config(CongestionControl::Cubic);
+        invalid.certificate = invalid_certificate;
+        assert!(matches!(
+            init_error(invalid),
+            Error::Io(error) if error.kind() == ErrorKind::InvalidData
+        ));
+
+        let other = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mismatched_key = tls._dir.path().join("mismatched-key.pem");
+        fs::write(&mismatched_key, other.signing_key.serialize_pem()).unwrap();
+        let mut mismatched = tls.config(CongestionControl::Cubic);
+        mismatched.private_key = mismatched_key;
+        assert!(matches!(init_error(mismatched), Error::Rustls(_)));
+    }
+
+    #[tokio::test]
+    async fn init_rejects_unrepresentable_idle_timeout() {
+        let tls = TlsFiles::new();
+        let mut config = tls.config(CongestionControl::Cubic);
+        config.max_idle_time = Duration::MAX;
+
+        assert!(matches!(init_error(config), Error::InvalidMaxIdleTime));
     }
 }
