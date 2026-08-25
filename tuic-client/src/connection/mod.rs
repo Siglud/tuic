@@ -34,13 +34,6 @@ static TIMEOUT: AtomicCell<Duration> = AtomicCell::new(Duration::from_secs(0));
 
 pub const ERROR_CODE: VarInt = VarInt::from_u32(0);
 const DEFAULT_CONCURRENT_STREAMS: u32 = 32;
-const PACKET_REORDERING_THRESHOLD: u32 = u32::MAX;
-
-fn reordering_tolerant_transport_config() -> TransportConfig {
-    let mut config = TransportConfig::default();
-    config.packet_threshold(PACKET_REORDERING_THRESHOLD);
-    config
-}
 
 #[derive(Clone)]
 pub struct Connection {
@@ -70,7 +63,7 @@ impl Connection {
         let mut config = ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(crypto).map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
-        let mut tp_cfg = reordering_tolerant_transport_config();
+        let mut tp_cfg = TransportConfig::default();
 
         tp_cfg
             .max_concurrent_bidi_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
@@ -347,16 +340,5 @@ mod tests {
     #[test]
     fn default_remote_stream_capacity_is_nonzero() {
         assert_eq!(DEFAULT_CONCURRENT_STREAMS, 32);
-    }
-
-    #[test]
-    fn transport_tolerates_large_packet_reordering() {
-        let config = reordering_tolerant_transport_config();
-        let debug = format!("{config:?}");
-
-        assert!(
-            debug.contains(&format!("packet_threshold: {PACKET_REORDERING_THRESHOLD}")),
-            "unexpected transport configuration: {debug}"
-        );
     }
 }

@@ -182,10 +182,6 @@ impl Connection {
     }
 
     pub async fn relay_packet(self, pkt: Bytes, addr: Address, assoc_id: u16) {
-        if self.is_closed() {
-            return;
-        }
-
         let addr_display = addr.to_string();
 
         log::info!(
@@ -203,16 +199,14 @@ impl Connection {
         };
 
         if let Err(err) = res {
-            if !self.is_closed() {
-                log::warn!(
-                    "[{id:#010x}] [{addr}] [{user}] [packet] [{assoc_id:#06x}] [to-{mode}] from {src_addr}: {err}",
-                    id = self.id(),
-                    addr = self.inner.remote_address(),
-                    user = self.auth,
-                    mode = self.udp_relay_mode.load().unwrap(),
-                    src_addr = addr_display,
-                );
-            }
+            log::warn!(
+                "[{id:#010x}] [{addr}] [{user}] [packet] [{assoc_id:#06x}] [to-{mode}] from {src_addr}: {err}",
+                id = self.id(),
+                addr = self.inner.remote_address(),
+                user = self.auth,
+                mode = self.udp_relay_mode.load().unwrap(),
+                src_addr = addr_display,
+            );
         }
     }
 }

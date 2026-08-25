@@ -101,18 +101,49 @@ fn authenticated_socks5_and_http_connect_relay_tcp() {
 #[ignore = "requires prebuilt workspace binaries"]
 fn tcp_burst_larger_than_receive_window_is_flow_controlled() {
     let mut harness = ServerHarness::start();
-    let (mut client, proxy_addr) = harness.start_client("flow-control", "native");
-    let diagnostics = Diagnostics::new([harness.log_capture(), client.log_capture()]);
     let payload = (0..4 * 1024 * 1024)
         .map(|index| index as u8)
         .collect::<Vec<_>>();
 
-    with_diagnostics(&diagnostics, || {
-        socks_connect_round_trip(proxy_addr, &payload);
-    });
+    for (name, receive_window) in [
+        ("flow-control-default", None),
+        ("flow-control-legacy", Some(8 * 1024 * 1024)),
+    ] {
+        let (mut client, proxy_addr) =
+            harness.start_client_with_receive_window(name, "native", receive_window);
+        let diagnostics = Diagnostics::new([harness.log_capture(), client.log_capture()]);
 
-    client.assert_running();
-    harness.assert_running();
+        with_diagnostics(&diagnostics, || {
+            socks_connect_upload(proxy_addr, &payload);
+        });
+
+        client.assert_running();
+        harness.assert_running();
+        drop(client);
+    }
+}
+
+fn socks_connect_upload(proxy_addr: SocketAddr, payload: &[u8]) {
+    let target = TcpEchoTarget::start_upload(payload.len());
+    let mut proxy = authenticated_socks_stream(proxy_addr);
+    let (reply, _) = socks_command(&mut proxy, 0x01, target.addr());
+    assert_eq!(reply, 0x00, "SOCKS5 CONNECT was rejected");
+
+    write_all(&mut proxy, payload, "write SOCKS5 CONNECT upload");
+    let mut acknowledged = [0];
+    read_exact(
+        &mut proxy,
+        &mut acknowledged,
+        "read SOCKS5 CONNECT upload acknowledgment",
+    );
+    assert_eq!(acknowledged, [1]);
+
+    let (observed, source) = target.wait().expect("TCP upload target failed");
+    assert_eq!(observed, payload, "TCP target observed the wrong upload");
+    assert!(
+        source.ip().is_loopback(),
+        "TCP upload source was not loopback"
+    );
 }
 
 #[test]
@@ -179,20 +210,33 @@ impl ServerHarness {
     }
 
     fn start_client(&self, name: &'static str, udp_relay_mode: &str) -> (ProcessGuard, SocketAddr) {
+        self.start_client_with_receive_window(name, udp_relay_mode, None)
+    }
+
+    fn start_client_with_receive_window(
+        &self,
+        name: &'static str,
+        udp_relay_mode: &str,
+        receive_window: Option<u32>,
+    ) -> (ProcessGuard, SocketAddr) {
         let config_path = self.temp_dir.path().join(format!("client-{name}.json"));
+        let mut relay = json!({
+            "server": format!("localhost:{}", self.relay_addr.port()),
+            "uuid": UUID,
+            "password": RELAY_PASSWORD,
+            "ip": "127.0.0.1",
+            "certificates": [&self.certificate],
+            "udp_relay_mode": udp_relay_mode,
+            "alpn": [ALPN],
+            "disable_native_certs": true
+        });
+        if let Some(receive_window) = receive_window {
+            relay["receive_window"] = json!(receive_window);
+        }
         write_json(
             &config_path,
             &json!({
-                "relay": {
-                    "server": format!("localhost:{}", self.relay_addr.port()),
-                    "uuid": UUID,
-                    "password": RELAY_PASSWORD,
-                    "ip": "127.0.0.1",
-                    "certificates": [&self.certificate],
-                    "udp_relay_mode": udp_relay_mode,
-                    "alpn": [ALPN],
-                    "disable_native_certs": true
-                },
+                "relay": relay,
                 "local": {
                     "server": "127.0.0.1:0",
                     "username": String::from_utf8_lossy(PROXY_USERNAME),
@@ -716,8 +760,22 @@ struct TcpEchoTarget {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum TcpResponse {
+    Echo,
+    Acknowledge,
+}
+
 impl TcpEchoTarget {
     fn start(payload_len: usize) -> Self {
+        Self::start_with_response(payload_len, TcpResponse::Echo)
+    }
+
+    fn start_upload(payload_len: usize) -> Self {
+        Self::start_with_response(payload_len, TcpResponse::Acknowledge)
+    }
+
+    fn start_with_response(payload_len: usize, response: TcpResponse) -> Self {
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("failed to bind TCP echo target");
         let addr = listener
@@ -737,9 +795,11 @@ impl TcpEchoTarget {
                 stream
                     .read_exact(&mut payload)
                     .map_err(|err| format!("TCP target read failed: {err}"))?;
-                stream
-                    .write_all(&payload)
-                    .map_err(|err| format!("TCP target echo failed: {err}"))?;
+                match response {
+                    TcpResponse::Echo => stream.write_all(&payload),
+                    TcpResponse::Acknowledge => stream.write_all(&[1]),
+                }
+                .map_err(|err| format!("TCP target response failed: {err}"))?;
                 Ok((payload, source))
             })();
             let _ = result_tx.send(outcome);

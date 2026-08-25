@@ -154,8 +154,6 @@ impl Connection {
                         Err(err) => conn.log_connection_error(&err),
                     }
                 }
-
-                conn.close_udp_sessions();
             }
             Err(err) if err.is_trivial() => {
                 log::debug!(
@@ -254,13 +252,6 @@ impl Connection {
 
     fn close(&self) {
         self.inner.close(ERROR_CODE, &[]);
-    }
-
-    fn close_udp_sessions(&self) {
-        let sessions = std::mem::take(&mut *self.udp_sessions.lock());
-        for session in sessions.into_values() {
-            session.close();
-        }
     }
 
     fn diagnostics(&self) -> ConnectionDiagnostics {
@@ -460,22 +451,6 @@ mod tests {
         task.await.unwrap();
 
         assert!(!server.is_closed());
-    }
-
-    #[tokio::test]
-    async fn connection_cleanup_drains_udp_sessions() {
-        let fixture = Fixture::new().await;
-        let session = UdpSession::new(fixture.server.clone(), 7, false, 1500).unwrap();
-        fixture
-            .server
-            .udp_sessions
-            .lock()
-            .insert(7, session.clone());
-
-        fixture.server.close_udp_sessions();
-
-        assert!(fixture.server.udp_sessions.lock().is_empty());
-        assert!(session.is_closed());
     }
 
     #[tokio::test]

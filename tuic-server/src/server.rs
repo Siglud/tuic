@@ -19,21 +19,14 @@ use std::{
 };
 use uuid::Uuid;
 
-const PACKET_REORDERING_THRESHOLD: u32 = u32::MAX;
 const MAX_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
-
-fn reordering_tolerant_transport_config() -> TransportConfig {
-    let mut config = TransportConfig::default();
-    config.packet_threshold(PACKET_REORDERING_THRESHOLD);
-    config
-}
 
 fn effective_receive_window(configured: u32) -> u32 {
     configured.min(MAX_STREAM_RECEIVE_WINDOW)
 }
 
 fn server_transport_config(cfg: &Config) -> Result<TransportConfig, Error> {
-    let mut config = reordering_tolerant_transport_config();
+    let mut config = TransportConfig::default();
     let receive_window = effective_receive_window(cfg.receive_window);
 
     if receive_window != cfg.receive_window {
@@ -275,17 +268,6 @@ mod tests {
             let server = Server::init(tls.config(congestion_control)).unwrap();
             assert!(server.ep.local_addr().unwrap().ip().is_loopback());
         }
-    }
-
-    #[test]
-    fn transport_tolerates_large_packet_reordering() {
-        let config = reordering_tolerant_transport_config();
-        let debug = format!("{config:?}");
-
-        assert!(
-            debug.contains(&format!("packet_threshold: {PACKET_REORDERING_THRESHOLD}")),
-            "unexpected transport configuration: {debug}"
-        );
     }
 
     #[test]
