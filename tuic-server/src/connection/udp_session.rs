@@ -189,6 +189,11 @@ impl UdpSession {
     pub fn close(&self) {
         signal_close(&self.0.close);
     }
+
+    #[cfg(test)]
+    pub(super) fn is_closed(&self) -> bool {
+        self.0.close.lock().is_none()
+    }
 }
 
 fn signal_close(close: &Mutex<Option<Sender<()>>>) {

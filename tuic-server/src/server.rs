@@ -19,6 +19,14 @@ use std::{
 };
 use uuid::Uuid;
 
+const PACKET_REORDERING_THRESHOLD: u32 = u32::MAX;
+
+fn reordering_tolerant_transport_config() -> TransportConfig {
+    let mut config = TransportConfig::default();
+    config.packet_threshold(PACKET_REORDERING_THRESHOLD);
+    config
+}
+
 pub struct Server {
     ep: Endpoint,
     users: Arc<HashMap<Uuid, Box<[u8]>>>,
@@ -47,7 +55,7 @@ impl Server {
         let mut config = ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(crypto).map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
-        let mut tp_cfg = TransportConfig::default();
+        let mut tp_cfg = reordering_tolerant_transport_config();
 
         tp_cfg
             .max_concurrent_bidi_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
@@ -247,6 +255,17 @@ mod tests {
             let server = Server::init(tls.config(congestion_control)).unwrap();
             assert!(server.ep.local_addr().unwrap().ip().is_loopback());
         }
+    }
+
+    #[test]
+    fn transport_tolerates_large_packet_reordering() {
+        let config = reordering_tolerant_transport_config();
+        let debug = format!("{config:?}");
+
+        assert!(
+            debug.contains(&format!("packet_threshold: {PACKET_REORDERING_THRESHOLD}")),
+            "unexpected transport configuration: {debug}"
+        );
     }
 
     #[tokio::test]
