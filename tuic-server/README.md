@@ -92,8 +92,10 @@ tuic-server -c PATH/TO/CONFIG
 
     // Optional. Maximum number of bytes the peer may transmit without acknowledgement on any one stream before becoming blocked
     // Should be set to at least the expected connection latency multiplied by the maximum desired throughput
-    // Default: 8MiB
-    "receive_window": 8388608,
+    // Larger values improve high-bandwidth, high-latency throughput but increase out-of-order reassembly pressure
+    // Values above 1MiB are capped by the server so legacy clients cannot overflow stream reassembly
+    // Default: 1MiB
+    "receive_window": 1048576,
 
     // Optional. Interval between UDP packet fragment garbage collection
     // Default: 3s

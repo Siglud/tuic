@@ -20,11 +20,52 @@ use std::{
 use uuid::Uuid;
 
 const PACKET_REORDERING_THRESHOLD: u32 = u32::MAX;
+const MAX_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
 
 fn reordering_tolerant_transport_config() -> TransportConfig {
     let mut config = TransportConfig::default();
     config.packet_threshold(PACKET_REORDERING_THRESHOLD);
     config
+}
+
+fn effective_receive_window(configured: u32) -> u32 {
+    configured.min(MAX_STREAM_RECEIVE_WINDOW)
+}
+
+fn server_transport_config(cfg: &Config) -> Result<TransportConfig, Error> {
+    let mut config = reordering_tolerant_transport_config();
+    let receive_window = effective_receive_window(cfg.receive_window);
+
+    if receive_window != cfg.receive_window {
+        log::warn!(
+            "configured receive_window {} exceeds the server safety limit; using {}",
+            cfg.receive_window,
+            receive_window,
+        );
+    }
+
+    config
+        .max_concurrent_bidi_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
+        .max_concurrent_uni_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
+        .send_window(cfg.send_window)
+        .stream_receive_window(VarInt::from_u32(receive_window))
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(cfg.max_idle_time).map_err(|_| Error::InvalidMaxIdleTime)?,
+        ));
+
+    match cfg.congestion_control {
+        CongestionControl::Cubic => {
+            config.congestion_controller_factory(Arc::new(CubicConfig::default()))
+        }
+        CongestionControl::NewReno => {
+            config.congestion_controller_factory(Arc::new(NewRenoConfig::default()))
+        }
+        CongestionControl::Bbr => {
+            config.congestion_controller_factory(Arc::new(BbrConfig::default()))
+        }
+    };
+
+    Ok(config)
 }
 
 pub struct Server {
@@ -41,6 +82,7 @@ pub struct Server {
 
 impl Server {
     pub fn init(cfg: Config) -> Result<Self, Error> {
+        let tp_cfg = server_transport_config(&cfg)?;
         let certs = utils::load_certs(cfg.certificate)?;
         let priv_key = utils::load_priv_key(cfg.private_key)?;
 
@@ -55,28 +97,6 @@ impl Server {
         let mut config = ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(crypto).map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
-        let mut tp_cfg = reordering_tolerant_transport_config();
-
-        tp_cfg
-            .max_concurrent_bidi_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
-            .max_concurrent_uni_streams(VarInt::from(DEFAULT_CONCURRENT_STREAMS))
-            .send_window(cfg.send_window)
-            .stream_receive_window(VarInt::from_u32(cfg.receive_window))
-            .max_idle_timeout(Some(
-                IdleTimeout::try_from(cfg.max_idle_time).map_err(|_| Error::InvalidMaxIdleTime)?,
-            ));
-
-        match cfg.congestion_control {
-            CongestionControl::Cubic => {
-                tp_cfg.congestion_controller_factory(Arc::new(CubicConfig::default()))
-            }
-            CongestionControl::NewReno => {
-                tp_cfg.congestion_controller_factory(Arc::new(NewRenoConfig::default()))
-            }
-            CongestionControl::Bbr => {
-                tp_cfg.congestion_controller_factory(Arc::new(BbrConfig::default()))
-            }
-        };
 
         config.transport_config(Arc::new(tp_cfg));
 
@@ -266,6 +286,31 @@ mod tests {
             debug.contains(&format!("packet_threshold: {PACKET_REORDERING_THRESHOLD}")),
             "unexpected transport configuration: {debug}"
         );
+    }
+
+    #[test]
+    fn receive_window_caps_legacy_client_bursts() {
+        let tls = TlsFiles::new();
+        let mut config = tls.config(CongestionControl::Cubic);
+        config.receive_window = 8 * 1024 * 1024;
+        let transport = server_transport_config(&config).unwrap();
+        let debug = format!("{transport:?}");
+
+        assert_eq!(
+            effective_receive_window(config.receive_window),
+            MAX_STREAM_RECEIVE_WINDOW,
+        );
+        assert!(
+            debug.contains(&format!(
+                "stream_receive_window: {MAX_STREAM_RECEIVE_WINDOW}"
+            )),
+            "unexpected transport configuration: {debug}",
+        );
+        assert_eq!(
+            effective_receive_window(MAX_STREAM_RECEIVE_WINDOW),
+            MAX_STREAM_RECEIVE_WINDOW
+        );
+        assert_eq!(effective_receive_window(512 * 1024), 512 * 1024);
     }
 
     #[tokio::test]

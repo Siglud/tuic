@@ -99,6 +99,24 @@ fn authenticated_socks5_and_http_connect_relay_tcp() {
 
 #[test]
 #[ignore = "requires prebuilt workspace binaries"]
+fn tcp_burst_larger_than_receive_window_is_flow_controlled() {
+    let mut harness = ServerHarness::start();
+    let (mut client, proxy_addr) = harness.start_client("flow-control", "native");
+    let diagnostics = Diagnostics::new([harness.log_capture(), client.log_capture()]);
+    let payload = (0..4 * 1024 * 1024)
+        .map(|index| index as u8)
+        .collect::<Vec<_>>();
+
+    with_diagnostics(&diagnostics, || {
+        socks_connect_round_trip(proxy_addr, &payload);
+    });
+
+    client.assert_running();
+    harness.assert_running();
+}
+
+#[test]
+#[ignore = "requires prebuilt workspace binaries"]
 fn udp_associate_relays_in_native_and_quic_modes() {
     let mut harness = ServerHarness::start();
 
@@ -144,6 +162,7 @@ impl ServerHarness {
                 "private_key": private_key,
                 "alpn": [ALPN],
                 "udp_relay_ipv6": false,
+                "receive_window": 8388608,
                 "log_level": "warn"
             }),
         );
