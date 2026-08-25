@@ -173,7 +173,7 @@ mod default {
     }
 
     pub fn receive_window() -> u32 {
-        8 * 1024 * 1024
+        1024 * 1024
     }
 
     pub fn gc_interval() -> Duration {
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(config.max_idle_time, Duration::from_secs(10));
         assert_eq!(config.max_external_packet_size, 1500);
         assert_eq!(config.send_window, 16 * 1024 * 1024);
-        assert_eq!(config.receive_window, 8 * 1024 * 1024);
+        assert_eq!(config.receive_window, 1024 * 1024);
         assert_eq!(config.gc_interval, Duration::from_secs(3));
         assert_eq!(config.gc_lifetime, Duration::from_secs(15));
         assert_eq!(config.log_level, LevelFilter::Warn);

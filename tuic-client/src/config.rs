@@ -220,7 +220,7 @@ mod default {
         }
 
         pub fn receive_window() -> u32 {
-            8 * 1024 * 1024
+            1024 * 1024
         }
 
         pub fn gc_interval() -> Duration {
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(config.relay.heartbeat, Duration::from_secs(3));
         assert!(!config.relay.disable_native_certs);
         assert_eq!(config.relay.send_window, 16 * 1024 * 1024);
-        assert_eq!(config.relay.receive_window, 8 * 1024 * 1024);
+        assert_eq!(config.relay.receive_window, 1024 * 1024);
         assert_eq!(config.relay.gc_interval, Duration::from_secs(3));
         assert_eq!(config.relay.gc_lifetime, Duration::from_secs(15));
 

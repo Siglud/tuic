@@ -2,12 +2,13 @@ use self::{authenticated::Authenticated, udp_session::UdpSession};
 use crate::{error::Error, utils::UdpRelayMode};
 use crossbeam_utils::atomic::AtomicCell;
 use parking_lot::Mutex;
-use quinn::{Connecting, Connection as QuinnConnection, VarInt};
+use quinn::{Connecting, Connection as QuinnConnection, ConnectionError, ConnectionStats, VarInt};
 use register_count::Counter;
 use std::{
     collections::HashMap,
+    fmt::{self, Display, Formatter},
     sync::{atomic::AtomicU32, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time;
 use tuic_quinn::{side, Authenticate, Connection as Model};
@@ -20,6 +21,45 @@ mod udp_session;
 
 pub const ERROR_CODE: VarInt = VarInt::from_u32(0);
 pub const DEFAULT_CONCURRENT_STREAMS: u32 = 32;
+
+#[derive(Debug)]
+struct ConnectionDiagnostics {
+    age: Duration,
+    close_reason: Option<ConnectionError>,
+    stats: ConnectionStats,
+    active_remote_uni_streams: usize,
+    active_remote_bi_streams: usize,
+    max_remote_uni_streams: u32,
+    max_remote_bi_streams: u32,
+    active_connect_tasks: usize,
+    active_udp_associations: usize,
+    udp_relay_mode: Option<&'static str>,
+    udp_sessions: usize,
+}
+
+impl Display for ConnectionDiagnostics {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "age={:?} close_reason={:?} udp_tx={:?} udp_rx={:?} frame_tx={:?} frame_rx={:?} path={:?} active_remote_streams=uni:{}/bi:{} max_remote_streams=uni:{}/bi:{} active_tasks=connect:{}/udp:{} udp_mode={:?} udp_sessions={}",
+            self.age,
+            self.close_reason,
+            self.stats.udp_tx,
+            self.stats.udp_rx,
+            self.stats.frame_tx,
+            self.stats.frame_rx,
+            self.stats.path,
+            self.active_remote_uni_streams,
+            self.active_remote_bi_streams,
+            self.max_remote_uni_streams,
+            self.max_remote_bi_streams,
+            self.active_connect_tasks,
+            self.active_udp_associations,
+            self.udp_relay_mode,
+            self.udp_sessions,
+        )
+    }
+}
 
 #[derive(Clone)]
 pub struct Connection {
@@ -36,6 +76,7 @@ pub struct Connection {
     remote_bi_stream_cnt: Counter,
     max_concurrent_uni_streams: Arc<AtomicU32>,
     max_concurrent_bi_streams: Arc<AtomicU32>,
+    established_at: Instant,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,15 +151,9 @@ impl Connection {
                                 user = conn.auth,
                             );
                         }
-                        Err(err) => log::warn!(
-                            "[{id:#010x}] [{addr}] [{user}] connection error: {err}",
-                            id = conn.id(),
-                            user = conn.auth,
-                        ),
+                        Err(err) => conn.log_connection_error(&err),
                     }
                 }
-
-                conn.close_udp_sessions();
             }
             Err(err) if err.is_trivial() => {
                 log::debug!(
@@ -156,6 +191,7 @@ impl Connection {
             remote_bi_stream_cnt: Counter::new(),
             max_concurrent_uni_streams: Arc::new(AtomicU32::new(DEFAULT_CONCURRENT_STREAMS)),
             max_concurrent_bi_streams: Arc::new(AtomicU32::new(DEFAULT_CONCURRENT_STREAMS)),
+            established_at: Instant::now(),
         }
     }
 
@@ -196,10 +232,11 @@ impl Connection {
             }
 
             log::debug!(
-                "[{id:#010x}] [{addr}] [{user}] packet fragment garbage collecting event",
+                "[{id:#010x}] [{addr}] [{user}] connection diagnostics: {diagnostics}",
                 id = self.id(),
                 addr = self.inner.remote_address(),
                 user = self.auth,
+                diagnostics = self.diagnostics(),
             );
             self.model.collect_garbage(gc_lifetime);
         }
@@ -217,11 +254,38 @@ impl Connection {
         self.inner.close(ERROR_CODE, &[]);
     }
 
-    fn close_udp_sessions(&self) {
-        let sessions = std::mem::take(&mut *self.udp_sessions.lock());
-        for session in sessions.into_values() {
-            session.close();
+    fn diagnostics(&self) -> ConnectionDiagnostics {
+        ConnectionDiagnostics {
+            age: self.established_at.elapsed(),
+            close_reason: self.inner.close_reason(),
+            stats: self.inner.stats(),
+            active_remote_uni_streams: self.remote_uni_stream_cnt.count(),
+            active_remote_bi_streams: self.remote_bi_stream_cnt.count(),
+            max_remote_uni_streams: self
+                .max_concurrent_uni_streams
+                .load(std::sync::atomic::Ordering::Relaxed),
+            max_remote_bi_streams: self
+                .max_concurrent_bi_streams
+                .load(std::sync::atomic::Ordering::Relaxed),
+            active_connect_tasks: self.model.task_connect_count(),
+            active_udp_associations: self.model.task_associate_count(),
+            udp_relay_mode: match self.udp_relay_mode.load() {
+                Some(UdpRelayMode::Native) => Some("native"),
+                Some(UdpRelayMode::Quic) => Some("quic"),
+                None => None,
+            },
+            udp_sessions: self.udp_sessions.lock().len(),
         }
+    }
+
+    fn log_connection_error(&self, err: &Error) {
+        log::warn!(
+            "[{id:#010x}] [{addr}] [{user}] connection error: {err}; error={err:?}; diagnostics={diagnostics}",
+            id = self.id(),
+            addr = self.inner.remote_address(),
+            user = self.auth,
+            diagnostics = self.diagnostics(),
+        );
     }
 }
 
@@ -390,18 +454,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_cleanup_drains_udp_sessions() {
+    async fn diagnostics_preserve_close_reason_and_runtime_state() {
         let fixture = Fixture::new().await;
-        let session = UdpSession::new(fixture.server.clone(), 7, false, 1500).unwrap();
         fixture
             .server
-            .udp_sessions
-            .lock()
-            .insert(7, session.clone());
+            .udp_relay_mode
+            .store(Some(UdpRelayMode::Quic));
+        fixture.server.close();
+        bounded(fixture.server.inner.closed()).await;
 
-        fixture.server.close_udp_sessions();
+        let diagnostics = fixture.server.diagnostics();
 
-        assert!(fixture.server.udp_sessions.lock().is_empty());
-        assert!(session.is_closed());
+        assert!(matches!(
+            diagnostics.close_reason,
+            Some(ConnectionError::LocallyClosed)
+        ));
+        assert_eq!(diagnostics.udp_relay_mode, Some("quic"));
+        assert_eq!(
+            diagnostics.max_remote_uni_streams,
+            DEFAULT_CONCURRENT_STREAMS
+        );
+        assert_eq!(
+            diagnostics.max_remote_bi_streams,
+            DEFAULT_CONCURRENT_STREAMS
+        );
+        assert_eq!(diagnostics.active_remote_uni_streams, 0);
+        assert_eq!(diagnostics.active_remote_bi_streams, 0);
+        assert_eq!(diagnostics.active_connect_tasks, 0);
+        assert_eq!(diagnostics.active_udp_associations, 0);
+        assert_eq!(diagnostics.udp_sessions, 0);
+        assert!(diagnostics.stats.udp_rx.datagrams > 0);
     }
 }
