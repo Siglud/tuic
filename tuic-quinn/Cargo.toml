@@ -17,9 +17,9 @@ futures-util = { version = "0.3.34", default-features = false, features = ["io",
 quinn = { version = "0.11.11", default-features = false, features = ["futures-io", "runtime-tokio", "rustls-ring"] }
 thiserror = { version = "2.0.20", default-features = false }
 tuic = { path = "../tuic", default-features = false, features = ["async_marshal", "marshal", "model"] }
-uuid = { version = "1.25.0", default-features = false, features = ["std"] }
+uuid = { version = "1.26.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }

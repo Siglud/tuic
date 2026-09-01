@@ -37,8 +37,8 @@ tokio = { version = "1.53.1", default-features = false, features = ["io-util", "
 tokio-util = { version = "0.7.19", default-features = false, features = ["compat"] }
 tuic = { path = "../tuic", default-features = false }
 tuic-quinn = { path = "../tuic-quinn", default-features = false }
-uuid = { version = "1.25.0", default-features = false, features = ["serde", "std"] }
+uuid = { version = "1.26.0", default-features = false, features = ["serde", "std"] }
 
 [dev-dependencies]
-rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 tempfile = "3.27.0"
