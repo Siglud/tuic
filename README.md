@@ -37,6 +37,8 @@ There are 4 crates provided in this repository:
 
 ## Testing
 
+Building and testing the workspace requires Rust 1.89.0 or newer.
+
 Run the workspace unit tests with all features enabled:
 
 ```bash
