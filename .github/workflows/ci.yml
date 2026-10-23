@@ -73,7 +73,7 @@ jobs:
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked
 
-      - name: Run client/server end-to-end tests
+      - name: Run client/server/forwarder end-to-end tests
         run: cargo test -p tuic-server --test proxy_e2e --locked -- --ignored --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1

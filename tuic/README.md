@@ -2,13 +2,13 @@
 
 Delicately-TUICed 0-RTT proxy protocol
 
-[![Version](https://img.shields.io/crates/v/tuic.svg?style=flat)](https://crates.io/crates/tuic)
-[![Documentation](https://img.shields.io/badge/docs-release-brightgreen.svg?style=flat)](https://docs.rs/tuic)
-[![License](https://img.shields.io/crates/l/tuic.svg?style=flat)](https://github.com/EAimTY/tuic/blob/dev/LICENSE)
+[![Release](https://img.shields.io/github/v/release/Siglud/tuic?style=flat)](../../../releases)
+[![Source](https://img.shields.io/badge/docs-source-brightgreen.svg?style=flat)](src)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=flat)](../LICENSE)
 
 ## Overview
 
-The TUIC protocol specification can be found in [SPEC.md](https://github.com/EAimTY/tuic/blob/dev/SPEC.md). This crate provides the low-level abstract of the TUIC protocol in Rust.
+The TUIC protocol specification can be found in [SPEC.md](../SPEC.md). This crate provides the low-level abstract of the TUIC protocol in Rust.
 
 Some optional features that can be enabled:
 
@@ -16,7 +16,7 @@ Some optional features that can be enabled:
 - `marshal` - Provides methods for (un)marsalling the protocol in sync flavor.
 - `async_marshal` - Provides methods for (un)marsalling the protocol in async flavor.
 
-The root of the protocol abstraction is the [`Header`](https://docs.rs/tuic/latest/tuic/enum.Header.html).
+The root of the protocol abstraction is the [`Header`](src/protocol/mod.rs).
 
 ## Versioning Syntax
 
@@ -32,11 +32,11 @@ The root of the protocol abstraction is the [`Header`](https://docs.rs/tuic/late
 To avoid breaking changes, import `tuic` into `Cargo.toml` using:
 
 ```toml
-tuic = "5.0.*"
+tuic = { git = "https://github.com/Siglud/tuic", branch = "main", version = "5.0.*" }
 ```
 
 ## License
 
-This library is licensed under [GNU General Public License v3.0](https://github.com/EAimTY/tuic/blob/dev/LICENSE)
+This library is licensed under [GNU General Public License v3.0](../LICENSE)
 
 However, the concept of the TUIC protocol is license-free. You can implement, modify, and redistribute the protocol without any restrictions, even for commercial use

@@ -43,11 +43,25 @@ pub struct ServerAddr {
     domain: String,
     port: u16,
     ip: Option<IpAddr>,
+    forwarder: Option<(String, u16)>,
 }
 
 impl ServerAddr {
-    pub fn new(domain: String, port: u16, ip: Option<IpAddr>) -> Self {
-        Self { domain, port, ip }
+    pub fn new(
+        domain: String,
+        port: u16,
+        ip: Option<IpAddr>,
+        forwarder: Option<(String, u16)>,
+    ) -> Result<Self, Error> {
+        if ip.is_some() && forwarder.is_some() {
+            return Err(Error::ConflictingRelayAddresses);
+        }
+        Ok(Self {
+            domain,
+            port,
+            ip,
+            forwarder,
+        })
     }
 
     pub fn server_name(&self) -> &str {
@@ -58,7 +72,12 @@ impl ServerAddr {
         if let Some(ip) = self.ip {
             Ok(vec![SocketAddr::from((ip, self.port))].into_iter())
         } else {
-            Ok(net::lookup_host((self.domain.as_str(), self.port))
+            let (host, port) = self
+                .forwarder
+                .as_ref()
+                .map(|(host, port)| (host.as_str(), *port))
+                .unwrap_or((self.domain.as_str(), self.port));
+            Ok(net::lookup_host((host, port))
                 .await?
                 .collect::<Vec<_>>()
                 .into_iter())
@@ -171,7 +190,9 @@ mod tests {
             "relay.example".to_string(),
             443,
             Some(Ipv4Addr::new(192, 0, 2, 7).into()),
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(address.server_name(), "relay.example");
         assert_eq!(
@@ -182,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_addr_resolves_localhost() {
-        let address = ServerAddr::new("localhost".to_string(), 43123, None);
+        let address = ServerAddr::new("localhost".to_string(), 43123, None, None).unwrap();
         let resolved = timeout(Duration::from_secs(5), address.resolve())
             .await
             .unwrap()
@@ -192,6 +213,60 @@ mod tests {
         assert!(!resolved.is_empty());
         assert!(resolved.iter().all(|addr| addr.ip().is_loopback()));
         assert!(resolved.iter().all(|addr| addr.port() == 43123));
+    }
+
+    #[tokio::test]
+    async fn forwarder_destination_is_independent_of_tls_name_and_server_port() {
+        for host in ["192.0.2.20", "2001:db8::20"] {
+            let address = ServerAddr::new(
+                "relay.example".to_string(),
+                443,
+                None,
+                Some((host.to_string(), 8443)),
+            )
+            .unwrap();
+            assert_eq!(address.server_name(), "relay.example");
+            assert_eq!(
+                address.resolve().await.unwrap().collect::<Vec<_>>(),
+                [SocketAddr::new(host.parse().unwrap(), 8443)],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarder_hostname_resolves_without_resolving_tls_hostname() {
+        let address = ServerAddr::new(
+            "relay.example".to_string(),
+            443,
+            None,
+            Some(("localhost".to_string(), 8443)),
+        )
+        .unwrap();
+        let resolved = timeout(Duration::from_secs(5), address.resolve())
+            .await
+            .unwrap()
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(!resolved.is_empty());
+        assert!(resolved
+            .iter()
+            .all(|addr| addr.ip().is_loopback() && addr.port() == 8443));
+        assert_eq!(address.server_name(), "relay.example");
+    }
+
+    #[tokio::test]
+    async fn forwarder_resolution_failure_does_not_fall_back_to_server() {
+        let address = ServerAddr::new(
+            "localhost".to_string(),
+            443,
+            None,
+            Some(("invalid\0forwarder".to_string(), 8443)),
+        )
+        .unwrap();
+        assert!(timeout(Duration::from_secs(5), address.resolve())
+            .await
+            .unwrap()
+            .is_err());
     }
 
     #[test]
