@@ -80,12 +80,14 @@ are closed automatically. A new datagram after expiry creates a new mapping and
 may use a different upstream source port. Set the idle timeout above the expected
 heartbeat/idle interval of the forwarded protocol.
 
-Each mapping buffers at most eight outbound datagrams. New clients are dropped
-when the client limit is reached, and datagrams are dropped when a client's queue
-is full; both conditions emit warnings. Socket failures close the affected
-mapping and are logged. UDP delivery is not guaranteed, and the forwarder does
-not add retransmission. It accepts full-size UDP datagrams without application
-truncation; network MTU and fragmentation limits still apply.
+Client datagrams are sent directly through each mapping's upstream socket,
+without a small application queue that can drop normal QUIC bursts. Socket
+backpressure is awaited up to `idle_timeout`; send failures close the affected
+mapping and emit warnings. New clients are dropped with a warning when the
+client limit is reached. UDP delivery is not guaranteed, and the forwarder does
+not add retransmission; OS socket buffers can still overflow under sustained
+overload. It accepts full-size UDP datagrams without application truncation;
+network MTU and fragmentation limits still apply.
 
 ## TUIC client configuration
 
@@ -120,6 +122,13 @@ used for TLS verification/SNI. The forwarder's hostname/IP and port are
 independent of the real server's address. Hostnames and bracketed IPv6 addresses
 are also supported, e.g. `"forwarder_server": "forwarder.example.com:8443"` or
 `"forwarder_server": "[2001:db8::20]:8443"`.
+Local computer names work too, for example
+`"forwarder_server": "MS-DESKTOP-SIGLUD:8443"` (the port is required).
+The client staggers attempts to resolved addresses so an unreachable address
+does not consume the whole connection timeout before another address is tried.
+If the forwarder uses `"server": "0.0.0.0:8443"`, it listens only on IPv4,
+even with `dual_stack: true`. To accept both IPv6 and IPv4, use
+`"server": "[::]:8443"` with `dual_stack: true` where supported.
 
 Do not also set `relay.ip`; configuring both it and `relay.forwarder_server` is
 an error. Legacy client configurations using only `relay.ip` still work as

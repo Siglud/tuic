@@ -193,6 +193,17 @@ For example, set `"server": "exit.example.com:443"` and
 `198.51.100.20:8443`. TLS verification/SNI still uses `exit.example.com`.
 Forwarder hostnames are resolved when connecting, and bracketed IPv6 addresses
 are supported, e.g. `"forwarder_server": "[2001:db8::20]:8443"`.
+Local computer names are also supported, e.g.
+`"forwarder_server": "MS-DESKTOP-SIGLUD:8443"`; the port is always required.
+When a hostname resolves to multiple addresses, connection attempts are staggered
+by 250 ms, trying the alternate IP family second if available. An unreachable
+IPv6 or stale address therefore does not block a reachable IPv4 address for the
+entire connection timeout. TLS still uses `relay.server`, not the computer name.
+With multiple candidates, a completed handshake selects the winner even when
+`zero_rtt_handshake` is enabled; single-address connections still support 0-RTT.
+The forwarder must listen on the selected address family: `0.0.0.0:8443` accepts
+only IPv4; use `[::]:8443` with `dual_stack: true` to also accept IPv4 on an
+IPv6 listener where supported.
 
 Do not set `relay.ip` when using `relay.forwarder_server`; the client rejects
 configurations that set both. Existing configurations without `forwarder_server`

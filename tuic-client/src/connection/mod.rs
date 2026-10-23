@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::{
     sync::{Mutex as AsyncMutex, OnceCell as AsyncOnceCell},
+    task::JoinSet,
     time,
 };
 use tuic_quinn::{side, Connection as Model};
@@ -34,6 +35,7 @@ static TIMEOUT: AtomicCell<Duration> = AtomicCell::new(Duration::from_secs(0));
 
 pub const ERROR_CODE: VarInt = VarInt::from_u32(0);
 const DEFAULT_CONCURRENT_STREAMS: u32 = 32;
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Connection {
@@ -101,10 +103,11 @@ impl Connection {
             Arc::new(TokioRuntime),
         )?;
 
-        ep.set_default_client_config(config);
+        ep.set_default_client_config(config.clone());
 
         let ep = Endpoint {
             ep,
+            config,
             server,
             uuid: cfg.uuid,
             password: cfg.password,
@@ -238,6 +241,7 @@ impl Connection {
 
 struct Endpoint {
     ep: QuinnEndpoint,
+    config: ClientConfig,
     server: ServerAddr,
     uuid: Uuid,
     password: Arc<[u8]>,
@@ -250,56 +254,109 @@ struct Endpoint {
 
 impl Endpoint {
     async fn connect(&mut self) -> Result<Connection, Error> {
-        let mut last_err = None;
+        let addresses = self.server.resolve().await?.collect();
+        let (ep, conn, zero_rtt_accepted) = connect_addresses(
+            self.ep.clone(),
+            self.config.clone(),
+            self.server.server_name().to_string(),
+            addresses,
+            self.zero_rtt_handshake,
+        )
+        .await?;
+        self.ep = ep;
 
-        for addr in self.server.resolve().await? {
-            let connect_to = async {
-                if !self
-                    .ep
-                    .local_addr()
-                    .is_ok_and(|local_addr| same_address_family(addr, local_addr))
-                {
-                    self.ep
-                        .rebind(UdpSocket::bind(wildcard_addr_for(addr)).map_err(|err| {
-                            Error::Socket("failed to create endpoint UDP socket", err)
-                        })?)
-                        .map_err(|err| {
-                            Error::Socket("failed to rebind endpoint UDP socket", err)
-                        })?;
-                }
+        Ok(Connection::new(
+            conn,
+            zero_rtt_accepted,
+            self.udp_relay_mode,
+            self.uuid,
+            self.password.clone(),
+            self.heartbeat,
+            self.gc_interval,
+            self.gc_lifetime,
+        ))
+    }
+}
 
-                let conn = self.ep.connect(addr, self.server.server_name())?;
-                let (conn, zero_rtt_accepted) = if self.zero_rtt_handshake {
-                    match conn.into_0rtt() {
-                        Ok((conn, zero_rtt_accepted)) => (conn, Some(zero_rtt_accepted)),
-                        Err(conn) => (conn.await?, None),
+async fn connect_addresses(
+    endpoint: QuinnEndpoint,
+    config: ClientConfig,
+    server_name: String,
+    mut addresses: Vec<SocketAddr>,
+    zero_rtt: bool,
+) -> Result<(QuinnEndpoint, QuinnConnection, Option<ZeroRttAccepted>), Error> {
+    // Early data does not prove reachability, so racing candidates need a full handshake.
+    let zero_rtt = zero_rtt && addresses.len() == 1;
+    if let Some(first) = addresses.first().copied() {
+        if let Some(index) = addresses
+            .iter()
+            .position(|addr| !same_address_family(*addr, first))
+        {
+            let alternate = addresses.remove(index);
+            addresses.insert(1, alternate);
+        }
+    }
+    let mut addresses = addresses.into_iter().peekable();
+    let mut attempts = JoinSet::new();
+    let mut next_attempt = time::Instant::now();
+    let mut last_err = Error::DnsResolve;
+
+    while addresses.peek().is_some() || !attempts.is_empty() {
+        tokio::select! {
+            _ = time::sleep_until(next_attempt), if addresses.peek().is_some() => {
+                let addr = addresses.next().unwrap();
+                let endpoint = endpoint.clone();
+                let config = config.clone();
+                let server_name = server_name.clone();
+                attempts.spawn(async move {
+                    let result = async {
+                        // Rebinding a shared endpoint would also move in-flight attempts.
+                        let endpoint = if same_address_family(addr, endpoint.local_addr()?) {
+                            endpoint
+                        } else {
+                            QuinnEndpoint::new(
+                                EndpointConfig::default(),
+                                None,
+                                UdpSocket::bind(wildcard_addr_for(addr)).map_err(|err| {
+                                    Error::Socket("failed to create endpoint UDP socket", err)
+                                })?,
+                                Arc::new(TokioRuntime),
+                            )?
+                        };
+                        let conn = endpoint.connect_with(config, addr, &server_name)?;
+                        let (conn, accepted) = if zero_rtt {
+                            match conn.into_0rtt() {
+                                Ok((conn, accepted)) => (conn, Some(accepted)),
+                                Err(conn) => (conn.await?, None),
+                            }
+                        } else {
+                            (conn.await?, None)
+                        };
+                        Ok((endpoint, conn, accepted))
+                    }.await;
+                    if let Err(err) = &result {
+                        log::debug!("[relay] connection attempt to {addr} failed: {err}");
                     }
-                } else {
-                    (conn.await?, None)
-                };
-
-                Ok((conn, zero_rtt_accepted))
-            };
-
-            match connect_to.await {
-                Ok((conn, zero_rtt_accepted)) => {
-                    return Ok(Connection::new(
-                        conn,
-                        zero_rtt_accepted,
-                        self.udp_relay_mode,
-                        self.uuid,
-                        self.password.clone(),
-                        self.heartbeat,
-                        self.gc_interval,
-                        self.gc_lifetime,
-                    ));
+                    result
+                });
+                next_attempt = time::Instant::now() + CONNECTION_ATTEMPT_DELAY;
+            }
+            Some(result) = attempts.join_next(), if !attempts.is_empty() => {
+                match result {
+                    Ok(Ok(connection)) => return Ok(connection),
+                    Ok(Err(err)) => last_err = err,
+                    Err(err) => return Err(std::io::Error::other(
+                        format!("connection attempt task failed: {err}")
+                    ).into()),
                 }
-                Err(err) => last_err = Some(err),
+                if attempts.is_empty() {
+                    next_attempt = time::Instant::now();
+                }
             }
         }
-
-        Err(last_err.unwrap_or(Error::DnsResolve))
     }
+
+    Err(last_err)
 }
 
 fn same_address_family(left: SocketAddr, right: SocketAddr) -> bool {
@@ -317,6 +374,159 @@ fn wildcard_addr_for(remote: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
+    use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
+
+    fn quic_configs() -> (quinn::ServerConfig, ClientConfig) {
+        let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        let server = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut crypto = RustlsClientConfig::builder_with_protocol_versions(&[&version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        crypto.enable_early_data = true;
+        let client = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn unreachable_addresses_do_not_block_working_candidates() {
+        for (blackhole_bind, server_bind) in [
+            ("[::1]:0", "127.0.0.1:0"),
+            ("127.0.0.1:0", "[::1]:0"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+        ] {
+            let blackhole = tokio::net::UdpSocket::bind(blackhole_bind).await.unwrap();
+            let blackhole_addr = blackhole.local_addr().unwrap();
+            let (server_config, client_config) = quic_configs();
+            let server =
+                QuinnEndpoint::server(server_config, server_bind.parse().unwrap()).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let endpoint = QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let attempts = connect_addresses(
+                endpoint,
+                client_config,
+                "localhost".to_string(),
+                vec![blackhole_addr, blackhole_addr, blackhole_addr, server_addr],
+                false,
+            );
+            let accept = async { server.accept().await.unwrap().await.unwrap() };
+            let (connection, incoming) = time::timeout(Duration::from_secs(2), async {
+                tokio::join!(attempts, accept)
+            })
+            .await
+            .expect("a blackholed address blocked the reachable address");
+            let (endpoint, connection, accepted) = connection.unwrap();
+            assert_eq!(connection.remote_address(), server_addr);
+            assert!(same_address_family(
+                endpoint.local_addr().unwrap(),
+                server_addr
+            ));
+            assert!(accepted.is_none());
+            assert_eq!(
+                incoming.remote_address().port(),
+                endpoint.local_addr().unwrap().port()
+            );
+            assert!(incoming.remote_address().ip().is_loopback());
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_attempts_preserve_tls_verification_and_report_errors() {
+        let (server_config, client_config) = quic_configs();
+        let server = QuinnEndpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let attempts = connect_addresses(
+            endpoint,
+            client_config,
+            "wrong.example".to_string(),
+            vec![server.local_addr().unwrap()],
+            false,
+        );
+        let accept = async { server.accept().await.unwrap().await };
+        let (result, _) = time::timeout(Duration::from_secs(2), async {
+            tokio::join!(attempts, accept)
+        })
+        .await
+        .unwrap();
+        let error = result.err().expect("an untrusted TLS name was accepted");
+        assert!(
+            error.to_string().contains("certificate not valid for name"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_zero_rtt_does_not_select_an_unreachable_candidate() {
+        let (server_config, client_config) = quic_configs();
+        let server = QuinnEndpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let endpoint = QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        let connect = async {
+            let (_, first, _) = connect_addresses(
+                endpoint.clone(),
+                client_config.clone(),
+                "localhost".to_string(),
+                vec![server_addr],
+                false,
+            )
+            .await
+            .unwrap();
+            time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let probe = endpoint
+                        .connect_with(client_config.clone(), blackhole_addr, "localhost")
+                        .unwrap();
+                    if probe.into_0rtt().is_ok() {
+                        break;
+                    }
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the initial connection did not cache a resumption ticket");
+            let (_, second, accepted) = time::timeout(
+                Duration::from_secs(2),
+                connect_addresses(
+                    endpoint,
+                    client_config,
+                    "localhost".to_string(),
+                    vec![blackhole_addr, server_addr],
+                    true,
+                ),
+            )
+            .await
+            .expect("cached early data bypassed address fallback")
+            .unwrap();
+            assert_eq!(second.remote_address(), server_addr);
+            assert!(accepted.is_none());
+            (first, second)
+        };
+        let accept = async {
+            let first = server.accept().await.unwrap().await.unwrap();
+            let second = server.accept().await.unwrap().await.unwrap();
+            (first, second)
+        };
+        time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connect, accept)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_address_list_reports_resolution_failure() {
+        let (_, config) = quic_configs();
+        let endpoint = QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let result =
+            connect_addresses(endpoint, config, "localhost".to_string(), vec![], false).await;
+        assert!(matches!(result, Err(Error::DnsResolve)));
+    }
 
     #[test]
     fn rejects_forwarder_and_ip_before_initializing_endpoint() {
