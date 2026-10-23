@@ -60,7 +60,9 @@ impl Connection {
                     res = io::copy_bidirectional(&mut conn, &mut stream) => Some(res),
                     _ = self.inner.closed() => None,
                 };
-                let _ = conn.get_mut().reset(ERROR_CODE);
+                if !matches!(&copy_result, Some(Ok(_))) {
+                    let _ = conn.get_mut().reset(ERROR_CODE);
+                }
                 let _ = stream.shutdown().await;
                 if let Some(res) = copy_result {
                     res?;

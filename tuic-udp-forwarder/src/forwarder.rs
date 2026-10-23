@@ -9,16 +9,15 @@ use std::{
 };
 use tokio::{
     net::{lookup_host, UdpSocket},
-    sync::mpsc::{self, error::TrySendError},
+    sync::watch,
     task::{AbortHandle, Id, JoinError, JoinSet},
     time::{self, Instant},
 };
 
 const MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
-const SESSION_QUEUE_SIZE: usize = 8;
-
 struct Session {
-    packets: mpsc::Sender<Vec<u8>>,
+    upstream: Arc<UdpSocket>,
+    activity: watch::Sender<Instant>,
     task: AbortHandle,
 }
 
@@ -111,7 +110,7 @@ impl Forwarder {
         if self
             .sessions
             .get(&client)
-            .is_some_and(|session| session.packets.is_closed())
+            .is_some_and(|session| session.activity.is_closed())
         {
             self.sessions.remove(&client).unwrap().task.abort();
         }
@@ -130,30 +129,43 @@ impl Forwarder {
             };
             let upstream = UdpSocket::bind(bind_address).await?;
             upstream.connect(self.upstream).await?;
-            let (packets, receiver) = mpsc::channel(SESSION_QUEUE_SIZE);
+            let upstream = Arc::new(upstream);
+            let (activity, receiver) = watch::channel(Instant::now());
             let listener = self.socket.clone();
             let idle_timeout = self.idle_timeout;
+            let session_upstream = upstream.clone();
             let task = self.tasks.spawn(async move {
                 (
                     client,
-                    run_session(listener, upstream, client, receiver, idle_timeout).await,
+                    run_session(listener, session_upstream, client, receiver, idle_timeout).await,
                 )
             });
-            self.sessions.insert(client, Session { packets, task });
+            self.sessions.insert(
+                client,
+                Session {
+                    upstream,
+                    activity,
+                    task,
+                },
+            );
             log::debug!("[{client}] created upstream mapping");
         }
 
-        self.sessions[&client]
-            .packets
-            .try_send(packet.to_vec())
-            .map_err(|err| match err {
-                TrySendError::Full(_) => {
-                    io::Error::new(ErrorKind::WouldBlock, "client datagram queue is full")
-                }
-                TrySendError::Closed(_) => {
-                    io::Error::new(ErrorKind::ConnectionAborted, "client mapping closed")
-                }
-            })
+        let session = &self.sessions[&client];
+        let result = time::timeout(self.idle_timeout, session.upstream.send(packet))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "upstream send timed out"))
+            .and_then(|result| result);
+        match result {
+            Ok(_) => {
+                session.activity.send_replace(Instant::now());
+                Ok(())
+            }
+            Err(err) => {
+                self.sessions.remove(&client).unwrap().task.abort();
+                Err(err)
+            }
+        }
     }
 
     fn reap_session(&mut self, result: Result<(Id, (SocketAddr, io::Result<()>)), JoinError>) {
@@ -185,21 +197,26 @@ impl Forwarder {
 
 async fn run_session(
     listener: Arc<UdpSocket>,
-    upstream: UdpSocket,
+    upstream: Arc<UdpSocket>,
     client: SocketAddr,
-    mut packets: mpsc::Receiver<Vec<u8>>,
+    mut activity: watch::Receiver<Instant>,
     idle_timeout: Duration,
 ) -> io::Result<()> {
     let mut buffer = vec![0; MAX_DATAGRAM_SIZE];
     let mut deadline = Instant::now() + idle_timeout;
     loop {
         tokio::select! {
-            _ = time::sleep_until(deadline) => return Ok(()),
-            packet = packets.recv() => {
-                let Some(packet) = packet else { return Ok(()) };
-                time::timeout(idle_timeout, upstream.send(&packet))
-                    .await.map_err(|_| io::Error::new(ErrorKind::TimedOut, "upstream send timed out"))??;
-                deadline = Instant::now() + idle_timeout;
+            _ = time::sleep_until(deadline) => {
+                deadline = deadline.max(*activity.borrow_and_update() + idle_timeout);
+                if deadline <= Instant::now() {
+                    return Ok(());
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                deadline = deadline.max(*activity.borrow_and_update() + idle_timeout);
             }
             result = upstream.recv(&mut buffer) => {
                 let len = result?;
@@ -343,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounds_client_mappings_and_per_client_queues() {
+    async fn forwards_bursts_larger_than_the_old_queue_and_bounds_client_mappings() {
         let upstream = udp_socket().await;
         let mut cfg = config(upstream.local_addr().unwrap());
         cfg.max_clients = 1.try_into().unwrap();
@@ -353,17 +370,10 @@ mod tests {
         let first = first_socket.local_addr().unwrap();
         let second = second_socket.local_addr().unwrap();
 
-        for _ in 0..SESSION_QUEUE_SIZE {
-            forwarder.forward_packet(first, b"queued").await.unwrap();
+        const BURST_SIZE: u8 = 64;
+        for index in 0..BURST_SIZE {
+            forwarder.forward_packet(first, &[index]).await.unwrap();
         }
-        assert_eq!(
-            forwarder
-                .forward_packet(first, b"overflow")
-                .await
-                .unwrap_err()
-                .kind(),
-            ErrorKind::WouldBlock
-        );
         assert_eq!(
             forwarder
                 .forward_packet(second, b"new client")
@@ -374,7 +384,12 @@ mod tests {
         );
         assert_eq!(forwarder.sessions.len(), 1);
         assert_eq!(forwarder.tasks.len(), 1);
-        assert_eq!(receive(&upstream).await.0, b"queued");
+        for index in 0..BURST_SIZE {
+            let (payload, peer) = receive(&upstream).await;
+            assert_eq!(payload, [index]);
+            upstream.send_to(&payload, peer).await.unwrap();
+            assert_eq!(receive(&first_socket).await.0, payload);
+        }
     }
 
     #[tokio::test]
@@ -401,13 +416,13 @@ mod tests {
         assert_eq!(receive(&upstream).await.0, b"refresh");
         time::pause();
         time::advance(Duration::from_secs(40)).await;
-        assert!(!forwarder.sessions[&client_addr].packets.is_closed());
+        assert!(!forwarder.sessions[&client_addr].activity.is_closed());
         time::resume();
         upstream.send_to(b"reply-refresh", peer).await.unwrap();
         assert_eq!(receive(&client).await.0, b"reply-refresh");
         time::pause();
         time::advance(Duration::from_secs(40)).await;
-        assert!(!forwarder.sessions[&client_addr].packets.is_closed());
+        assert!(!forwarder.sessions[&client_addr].activity.is_closed());
         time::advance(Duration::from_secs(21)).await;
         let result = forwarder.tasks.join_next_with_id().await.unwrap();
         forwarder.reap_session(result);
@@ -423,6 +438,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapping_expiry_uses_the_forwarder_timeout_not_the_protocol_timeout() {
+        for configured in [None, Some(Duration::from_secs(5))] {
+            let upstream = udp_socket().await;
+            let client = udp_socket().await;
+            let client_addr = client.local_addr().unwrap();
+            let mut cfg = config(upstream.local_addr().unwrap());
+            if let Some(timeout) = configured {
+                cfg.idle_timeout = timeout;
+            }
+            let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+            forwarder
+                .forward_packet(client_addr, b"initial")
+                .await
+                .unwrap();
+            receive(&upstream).await;
+
+            time::pause();
+            let timeout = configured.unwrap_or(Duration::from_secs(60));
+            time::advance(timeout - Duration::from_secs(1)).await;
+            assert!(!forwarder.sessions[&client_addr].activity.is_closed());
+            time::advance(Duration::from_secs(2)).await;
+            let result = forwarder.tasks.join_next_with_id().await.unwrap();
+            forwarder.reap_session(result);
+            assert!(forwarder.sessions.is_empty());
+            time::resume();
+        }
+    }
+
+    #[tokio::test]
     async fn recreates_expired_mapping_before_old_task_is_reaped() {
         let upstream = udp_socket().await;
         let client = udp_socket().await.local_addr().unwrap();
@@ -435,7 +479,7 @@ mod tests {
         time::pause();
         time::advance(Duration::from_secs(61)).await;
         tokio::task::yield_now().await;
-        assert!(forwarder.sessions[&client].packets.is_closed());
+        assert!(forwarder.sessions[&client].activity.is_closed());
         time::resume();
         forwarder
             .forward_packet(client, b"replacement")
@@ -457,7 +501,7 @@ mod tests {
             .unwrap();
         forwarder.forward_packet(client, b"initial").await.unwrap();
         receive(&upstream).await;
-        let sender = forwarder.sessions[&client].packets.clone();
+        let sender = forwarder.sessions[&client].activity.clone();
         drop(forwarder);
         time::timeout(TEST_TIMEOUT, sender.closed()).await.unwrap();
     }
@@ -469,19 +513,14 @@ mod tests {
         cfg.max_clients = 1.try_into().unwrap();
         let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
         let client = udp_socket().await;
-        forwarder
+        let err = forwarder
             .forward_packet(
                 client.local_addr().unwrap(),
                 &vec![0; MAX_DATAGRAM_SIZE + 1],
             )
             .await
-            .unwrap();
-        let result = time::timeout(TEST_TIMEOUT, forwarder.tasks.join_next_with_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.as_ref().unwrap().1 .1.is_err());
-        forwarder.reap_session(result);
+            .unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::WouldBlock);
         assert!(forwarder.sessions.is_empty());
 
         forwarder

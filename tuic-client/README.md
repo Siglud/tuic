@@ -110,6 +110,7 @@ garbage collection.
         "timeout": "8s",
 
         // Optional. Heartbeat interval duration string; use a positive interval.
+        // Sent only while TCP relay tasks or UDP associations are active.
         // Default: "3s"
         "heartbeat": "3s",
 
@@ -193,11 +194,41 @@ For example, set `"server": "exit.example.com:443"` and
 `198.51.100.20:8443`. TLS verification/SNI still uses `exit.example.com`.
 Forwarder hostnames are resolved when connecting, and bracketed IPv6 addresses
 are supported, e.g. `"forwarder_server": "[2001:db8::20]:8443"`.
+Local computer names are also supported, e.g.
+`"forwarder_server": "MS-DESKTOP-SIGLUD:8443"`; the port is always required.
+When a hostname resolves to multiple addresses, connection attempts are staggered
+by 250 ms, trying the alternate IP family second if available. An unreachable
+IPv6 or stale address therefore does not block a reachable IPv4 address for the
+entire connection timeout. TLS still uses `relay.server`, not the computer name.
+With multiple candidates, a completed handshake selects the winner even when
+`zero_rtt_handshake` is enabled; single-address connections still support 0-RTT.
+The forwarder must listen on the selected address family: `0.0.0.0:8443` accepts
+only IPv4; use `[::]:8443` with `dual_stack: true` to also accept IPv4 on an
+IPv6 listener where supported.
 
 Do not set `relay.ip` when using `relay.forwarder_server`; the client rejects
 configurations that set both. Existing configurations without `forwarder_server`
 keep their previous behavior, including `relay.ip` DNS overrides. Forwarder
 failures do not cause a fallback to a direct connection to the real server.
+
+## Connection cleanup and logging
+
+An idle relay connection may expire using the server's `max_idle_time`
+(default `"10s"`). Heartbeats stop when no TCP relay tasks or UDP associations
+remain; the next proxy request establishes a new connection. Idle expiration
+with no active tasks is logged at `info`, and local connection closure at
+`debug`. A timeout while tasks are still active remains a warning.
+
+QUIC stream resets or stop requests with application code `0`, used for stream
+cleanup by older TUIC servers, are logged at `info` for SOCKS5, HTTP CONNECT,
+and plain HTTP relaying. Nonzero stream codes, TCP socket resets (including
+Windows error 10054), and other relay failures remain warnings because they
+are not confirmed normal cleanup. Updated servers finish successful TCP relays
+gracefully instead of resetting them.
+
+The forwarder's `idle_timeout` only expires UDP mappings; it does not override
+the server's QUIC timeout. See the
+[forwarder timeout explanation](../tuic-udp-forwarder/README.md#idle-timeout-versus-quic-connection-lifetime).
 
 ## License
 

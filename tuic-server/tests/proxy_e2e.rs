@@ -171,45 +171,51 @@ fn udp_associate_relays_in_native_and_quic_modes() {
 fn udp_forwarder_preserves_end_to_end_tuic_tcp_and_udp() {
     let mut harness = ServerHarness::start();
     let config_path = harness.temp_dir.path().join("forwarder.json");
-    write_jsonc(
-        &config_path,
-        &json!({
-            "server": "[::]:0",
-            "dual_stack": true,
-            "upstream": harness.relay_addr.to_string(),
-            "log_level": "warn"
-        }),
-    );
-    let mut forwarder = ProcessGuard::spawn("tuic-udp-forwarder", &forwarder_bin(), &config_path);
-    let forwarder_addr = forwarder.wait_for_address("UDP forwarder started, listening on ");
-
-    for mode in ["native", "quic"] {
-        let forwarder_host = if mode == "native" {
-            "127.0.0.1"
-        } else {
-            "localhost"
-        };
-        let (mut client, proxy_addr) = harness.start_client_at(
-            mode,
-            mode,
-            None,
-            Some(format!("{forwarder_host}:{}", forwarder_addr.port())),
+    for listen in ["[::]:0", "0.0.0.0:0"] {
+        write_jsonc(
+            &config_path,
+            &json!({
+                "server": listen,
+                "dual_stack": true,
+                "upstream": harness.relay_addr.to_string(),
+                "log_level": "warn"
+            }),
         );
-        let diagnostics = Diagnostics::new([
-            harness.log_capture(),
-            forwarder.log_capture(),
-            client.log_capture(),
-        ]);
-        with_diagnostics(&diagnostics, || {
-            socks_connect_round_trip(proxy_addr, &unique_payload("forwarded-socks"));
-            http_connect_round_trip(proxy_addr, &unique_payload("forwarded-http"));
-            udp_associate_round_trip(proxy_addr, &unique_payload("forwarded-udp"));
-            socks_connect_upload(proxy_addr, &vec![0x5a; 4 * 1024 * 1024]);
-        });
-        client.assert_running();
-        drop(client);
+        let mut forwarder =
+            ProcessGuard::spawn("tuic-udp-forwarder", &forwarder_bin(), &config_path);
+        let forwarder_addr = forwarder.wait_for_address("UDP forwarder started, listening on ");
+
+        for mode in ["native", "quic"] {
+            let forwarder_host = if mode == "native" {
+                "127.0.0.1"
+            } else {
+                "localhost"
+            };
+            let (mut client, proxy_addr) = harness.start_client_at(
+                mode,
+                mode,
+                None,
+                Some(format!("{forwarder_host}:{}", forwarder_addr.port())),
+            );
+            let diagnostics = Diagnostics::new([
+                harness.log_capture(),
+                forwarder.log_capture(),
+                client.log_capture(),
+            ]);
+            with_diagnostics(&diagnostics, || {
+                socks_connect_round_trip(proxy_addr, &unique_payload("forwarded-socks"));
+                http_connect_round_trip(proxy_addr, &unique_payload("forwarded-http"));
+                udp_associate_round_trip(proxy_addr, &unique_payload("forwarded-udp"));
+                socks_connect_upload(proxy_addr, &vec![0x5a; 4 * 1024 * 1024]);
+            });
+            client.assert_running();
+            drop(client);
+        }
+        forwarder.assert_running();
+        let log = forwarder.log_capture().render();
+        assert!(!log.contains("failed forwarding datagram"), "{log}");
+        assert!(!log.contains("upstream mapping failed"), "{log}");
     }
-    forwarder.assert_running();
     harness.assert_running();
 }
 
