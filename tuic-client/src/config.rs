@@ -3,7 +3,7 @@ use humantime::Duration as HumanDuration;
 use lexopt::{Arg, Error as ArgumentError, Parser};
 use log::LevelFilter;
 use serde::{de::Error as DeError, Deserialize, Deserializer};
-use serde_json::Error as SerdeError;
+use serde_json_lenient::Error as SerdeError;
 use std::{
     env::ArgsOs,
     ffi::OsString,
@@ -23,7 +23,7 @@ const HELP_MSG: &str = r#"
 Usage tuic-client [arguments]
 
 Arguments:
-    -c, --config <path>     Path to the config file (required)
+    -c, --config <path>     Path to the JSONC config file (any extension, required)
     -v, --version           Print the version
     -h, --help              Print this help message
 "#;
@@ -171,7 +171,7 @@ impl Config {
         }
 
         let file = File::open(path.unwrap())?;
-        Ok(serde_json::from_reader(file)?)
+        Ok(serde_json_lenient::from_reader(file)?)
     }
 }
 
@@ -359,7 +359,7 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::fs;
-    use tempfile::NamedTempFile;
+    use tempfile::Builder;
 
     const UUID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 
@@ -383,14 +383,86 @@ mod tests {
     }
 
     fn parse_file(value: &Value) -> Result<Config, ConfigError> {
-        let file = NamedTempFile::new().unwrap();
-        fs::write(file.path(), serde_json::to_vec(value).unwrap()).unwrap();
+        parse_text_file(&value.to_string(), "")
+    }
+
+    fn parse_text_file(text: &str, suffix: &str) -> Result<Config, ConfigError> {
+        let file = Builder::new().suffix(suffix).tempfile().unwrap();
+        fs::write(file.path(), text).unwrap();
 
         Config::parse_from(vec![
             OsString::from("tuic-client"),
             OsString::from("--config"),
             file.path().as_os_str().to_owned(),
         ])
+    }
+
+    #[test]
+    fn cli_loads_jsonc_regardless_of_extension() {
+        let text = r#"
+        /* Client configuration */
+        {
+            "relay": {
+                "server": "example.com:443", // Real TUIC server
+                "uuid": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+                "password": "//secret/*literal*/\"quoted\"\\path",
+                "alpn": ["tuic", /* Array comment */],
+            },
+            "local": { "server": "127.0.0.1:1080", },
+        } // No final newline"#;
+
+        for suffix in [".json", ".jsonc", ".conf", ""] {
+            let config = parse_text_file(text, suffix).unwrap();
+            assert_eq!(config.relay.server, ("example.com".to_string(), 443));
+            assert_eq!(
+                config.relay.password.as_ref(),
+                b"//secret/*literal*/\"quoted\"\\path"
+            );
+            assert_eq!(config.relay.alpn, [b"tuic".to_vec()]);
+            assert_eq!(config.local.server, "127.0.0.1:1080".parse().unwrap());
+            assert_eq!(config.log_level, LevelFilter::Warn);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_malformed_jsonc() {
+        let valid = minimal_config().to_string();
+        for text in [
+            "{ invalid".to_string(),
+            format!("{valid} /* unterminated"),
+            format!("{valid}\n{{}}"),
+            valid.replace("\"relay\":", "\"relay\" /* missing colon */"),
+            valid.replace("\"server\":", "server:"),
+            valid.replacen("\"server\"", "'server'", 1),
+        ] {
+            match parse_text_file(&text, ".json") {
+                Err(ConfigError::Serde(error)) => {
+                    assert!(error.line() > 0);
+                    assert!(error.column() > 0);
+                }
+                _ => panic!("expected a JSONC parsing error"),
+            }
+        }
+    }
+
+    #[test]
+    fn readme_configurations_are_valid_jsonc() {
+        let mut examples = 0;
+        for readme in [
+            include_str!("../README.md"),
+            include_str!("../../README.md"),
+            include_str!("../../tuic-udp-forwarder/README.md"),
+        ] {
+            for block in readme.split("```jsonc").skip(1) {
+                let text = block.split_once("```").unwrap().0;
+                let value: serde_json_lenient::Value = serde_json_lenient::from_str(text).unwrap();
+                if value.get("relay").is_some() {
+                    parse_text_file(text, ".json").unwrap();
+                    examples += 1;
+                }
+            }
+        }
+        assert_eq!(examples, 4);
     }
 
     #[test]

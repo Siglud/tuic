@@ -171,7 +171,7 @@ fn udp_associate_relays_in_native_and_quic_modes() {
 fn udp_forwarder_preserves_end_to_end_tuic_tcp_and_udp() {
     let mut harness = ServerHarness::start();
     let config_path = harness.temp_dir.path().join("forwarder.json");
-    write_json(
+    write_jsonc(
         &config_path,
         &json!({
             "server": "[::]:0",
@@ -232,7 +232,7 @@ impl ServerHarness {
             .expect("failed to write private key");
 
         let config_path = temp_dir.path().join("server.json");
-        write_json(
+        write_jsonc(
             &config_path,
             &json!({
                 "server": "127.0.0.1:0",
@@ -295,7 +295,7 @@ impl ServerHarness {
         if let Some(receive_window) = receive_window {
             relay["receive_window"] = json!(receive_window);
         }
-        write_json(
+        write_jsonc(
             &config_path,
             &json!({
                 "relay": relay,
@@ -1027,11 +1027,14 @@ fn unique_payload(label: &str) -> Vec<u8> {
     format!("tuic-e2e:{label}:{}:{timestamp}:{id}", std::process::id()).into_bytes()
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) {
-    let file = fs::File::create(path)
-        .unwrap_or_else(|err| panic!("failed to create {}: {err}", path.display()));
-    serde_json::to_writer_pretty(file, value)
-        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+fn write_jsonc(path: &Path, value: &serde_json::Value) {
+    let json = serde_json::to_string_pretty(value).expect("failed to serialize config");
+    let body = json.strip_suffix('}').expect("config must be an object");
+    let text = format!(
+        "/* JSONC config stored in a .json file */\n{},\n}}\n// End of config\n",
+        body.trim_end()
+    );
+    fs::write(path, text).unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
 fn client_bin() -> PathBuf {

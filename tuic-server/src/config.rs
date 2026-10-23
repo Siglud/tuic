@@ -3,7 +3,7 @@ use humantime::Duration as HumanDuration;
 use lexopt::{Arg, Error as ArgumentError, Parser};
 use log::LevelFilter;
 use serde::{de::Error as DeError, Deserialize, Deserializer};
-use serde_json::Error as SerdeError;
+use serde_json_lenient::Error as SerdeError;
 use std::{
     collections::HashMap, env::ArgsOs, ffi::OsString, fmt::Display, fs::File, io::Error as IoError,
     net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
@@ -15,7 +15,7 @@ const HELP_MSG: &str = r#"
 Usage tuic-server [arguments]
 
 Arguments:
-    -c, --config <path>     Path to the config file (required)
+    -c, --config <path>     Path to the JSONC config file (any extension, required)
     -v, --version           Print the version
     -h, --help              Print this help message
 "#;
@@ -127,7 +127,7 @@ impl Config {
         }
 
         let file = File::open(path.unwrap())?;
-        Ok(serde_json::from_reader(file)?)
+        Ok(serde_json_lenient::from_reader(file)?)
     }
 }
 
@@ -255,7 +255,7 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::{ffi::OsString, fs};
-    use tempfile::NamedTempFile;
+    use tempfile::Builder;
 
     const UUID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 
@@ -273,14 +273,85 @@ mod tests {
     }
 
     fn parse_file(value: &Value) -> Result<Config, ConfigError> {
-        let file = NamedTempFile::new().unwrap();
-        fs::write(file.path(), serde_json::to_vec(value).unwrap()).unwrap();
+        parse_text_file(&value.to_string(), "")
+    }
+
+    fn parse_text_file(text: &str, suffix: &str) -> Result<Config, ConfigError> {
+        let file = Builder::new().suffix(suffix).tempfile().unwrap();
+        fs::write(file.path(), text).unwrap();
 
         Config::parse_from(vec![
             OsString::from("tuic-server"),
             OsString::from("--config"),
             file.path().as_os_str().to_owned(),
         ])
+    }
+
+    #[test]
+    fn cli_loads_jsonc_regardless_of_extension() {
+        let text = r#"
+        /* Server configuration */
+        {
+            "server": "127.0.0.1:443", // UDP listener
+            "users": {
+                "67e55044-10b1-426f-9247-bb680e5fe0c8": "//secret/*literal*/\"quoted\"\\path",
+            },
+            "certificate": "certificate.pem",
+            "private_key": "private-key.pem",
+            "alpn": ["tuic", /* Array comment */],
+        } // No final newline"#;
+
+        for suffix in [".json", ".jsonc", ".conf", ""] {
+            let config = parse_text_file(text, suffix).unwrap();
+            assert_eq!(config.server, "127.0.0.1:443".parse().unwrap());
+            assert_eq!(
+                config.users[&Uuid::parse_str(UUID).unwrap()].as_ref(),
+                b"//secret/*literal*/\"quoted\"\\path"
+            );
+            assert_eq!(config.certificate, PathBuf::from("certificate.pem"));
+            assert_eq!(config.alpn, [b"tuic".to_vec()]);
+            assert_eq!(config.log_level, LevelFilter::Warn);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_malformed_jsonc() {
+        let valid = minimal_config().to_string();
+        for text in [
+            "{ invalid".to_string(),
+            format!("{valid} /* unterminated"),
+            format!("{valid}\n{{}}"),
+            valid.replace("\"users\":", "\"users\" /* missing colon */"),
+            valid.replace("\"server\":", "server:"),
+            valid.replacen("\"server\"", "'server'", 1),
+        ] {
+            match parse_text_file(&text, ".json") {
+                Err(ConfigError::Serde(error)) => {
+                    assert!(error.line() > 0);
+                    assert!(error.column() > 0);
+                }
+                _ => panic!("expected a JSONC parsing error"),
+            }
+        }
+    }
+
+    #[test]
+    fn readme_configurations_are_valid_jsonc() {
+        let mut examples = 0;
+        for readme in [
+            include_str!("../README.md"),
+            include_str!("../../README.md"),
+        ] {
+            for block in readme.split("```jsonc").skip(1) {
+                let text = block.split_once("```").unwrap().0;
+                let value: serde_json_lenient::Value = serde_json_lenient::from_str(text).unwrap();
+                if value.get("users").is_some() {
+                    parse_text_file(text, ".json").unwrap();
+                    examples += 1;
+                }
+            }
+        }
+        assert_eq!(examples, 2);
     }
 
     #[test]
