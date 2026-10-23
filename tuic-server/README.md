@@ -97,6 +97,7 @@ such as `"250ms"`, `"3s"`, or `"1m"`.
 
     // Optional. QUIC idle timeout duration string; must fit in a QUIC idle timeout.
     // "0s" disables the idle timeout. Default: "10s".
+    // Independent of a UDP forwarder's idle_timeout, which only expires UDP mappings.
     "max_idle_time": "10s",
 
     // Optional. Maximum packet size the server can receive from outbound UDP sockets, in bytes
@@ -132,6 +133,19 @@ such as `"250ms"`, `"3s"`, or `"1m"`.
     "log_level": "warn"
 }
 ```
+
+## Idle connection lifetime
+
+`max_idle_time` controls the QUIC connection's idle timeout, not a forwarder's
+UDP mapping lifetime. TUIC clients send heartbeats only while relay tasks are
+active, so a connection with no remaining tasks can expire after the default
+`"10s"` even when the forwarder's `idle_timeout` is `"60s"`. Set a larger
+`max_idle_time` to permit longer idle QUIC connections, and ensure any
+forwarder's mapping timeout also covers the expected gaps between datagrams.
+The forwarder cannot keep QUIC alive or override this setting.
+
+Successful TCP relays finish gracefully; stream resets are reserved for errors
+or interrupted relays.
 
 ## License
 

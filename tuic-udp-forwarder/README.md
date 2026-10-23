@@ -50,7 +50,8 @@ Complete configuration (only `server` and `upstream` are required):
     // false restricts it to IPv6. Omit or use null for the OS default; ignored for IPv4.
     "dual_stack": null,
     // Optional. Positive duration string fitting in a timer, e.g. "1250ms" or "1m".
-    // Activity in either direction keeps the mapping alive. Default: "60s".
+    // UDP mapping expiry only, not the upstream protocol's connection timeout.
+    // Activity in either direction keeps the mapping alive. Omit for "60s".
     "idle_timeout": "60s",
     // Optional. Positive integer fitting in usize: maximum simultaneous client mappings.
     // Default: 1024.
@@ -66,7 +67,7 @@ Complete configuration (only `server` and `upstream` are required):
 | `server` | UDP listening IP and port; port `0` requests an ephemeral port | Required |
 | `upstream` | Fixed upstream `HOST:PORT`; IPv6 addresses use `[ADDRESS]:PORT` | Required |
 | `dual_stack` | Whether an IPv6 listener also accepts IPv4 | OS default |
-| `idle_timeout` | Positive duration, e.g. `"60s"`; activity in either direction keeps a mapping alive | `"60s"` |
+| `idle_timeout` | UDP mapping expiry after inactivity, e.g. `"60s"`; independent of QUIC connection expiry | `"60s"` when omitted |
 | `max_clients` | Maximum simultaneous client IP/port mappings; must be positive | `1024` |
 | `log_level` | `off`, `error`, `warn`, `info`, `debug`, or `trace` | `"warn"` |
 
@@ -79,6 +80,28 @@ Replies from other source addresses are rejected by the socket. Idle mappings
 are closed automatically. A new datagram after expiry creates a new mapping and
 may use a different upstream source port. Set the idle timeout above the expected
 heartbeat/idle interval of the forwarded protocol.
+
+### Idle timeout versus QUIC connection lifetime
+
+`idle_timeout` controls only how long the forwarder retains a client's UDP
+mapping without traffic in either direction. Omit the property to use `"60s"`;
+an empty string (`""`), `null`, or `"0s"` is invalid, not a request for the
+default. The forwarder does not parse QUIC, negotiate its idle timeout, send
+heartbeats, or keep the end-to-end connection alive.
+
+The TUIC server's `max_idle_time` separately controls the QUIC idle timeout
+(default `"10s"`). The client uses that timeout and sends heartbeats at
+`relay.heartbeat` (default `"3s"`) only while TCP relay tasks or UDP associations
+are active. After those tasks end, the QUIC connection can expire after about
+10 seconds even though the forwarder retains its UDP mapping for 60 seconds
+after the last datagram. This does not mean `idle_timeout` was ignored.
+
+To retain an idle QUIC connection longer, adjust the server's `max_idle_time`;
+increasing the forwarder's `idle_timeout` alone cannot extend it. Conversely,
+a forwarder timeout shorter than gaps between datagrams can expire a mapping
+while QUIC is still alive and disrupt the connection. Keep the mapping timeout
+above the expected heartbeat interval with room for delays and packet loss.
+Actual expiry also depends on network activity and QUIC transport timers.
 
 Client datagrams are sent directly through each mapping's upstream socket,
 without a small application queue that can drop normal QUIC bursts. Socket

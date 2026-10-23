@@ -1,5 +1,8 @@
 use super::{udp_session::UdpSession, Server, UDP_SESSIONS};
-use crate::connection::{Connection as TuicConnection, ERROR_CODE};
+use crate::{
+    connection::{Connection as TuicConnection, ERROR_CODE},
+    error::stream_error_log_level,
+};
 use socks5_proto::{Address, Reply, Response};
 use std::net::SocketAddr;
 use tokio::{
@@ -136,7 +139,7 @@ impl Server {
                         Err(err) => {
                             let _ = stream.shutdown().await;
                             let _ = relay.get_mut().reset(ERROR_CODE);
-                            log::warn!("[socks5] [{peer_addr}] [connect] [{target_addr}] TCP stream relaying error: {err}");
+                            log::log!(stream_error_log_level(&err), "[socks5] [{peer_addr}] [connect] [{target_addr}] TCP stream relaying error: {err}");
                         }
                     },
                     Err(err) => {

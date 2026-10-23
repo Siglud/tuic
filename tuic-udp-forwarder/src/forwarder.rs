@@ -438,6 +438,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapping_expiry_uses_the_forwarder_timeout_not_the_protocol_timeout() {
+        for configured in [None, Some(Duration::from_secs(5))] {
+            let upstream = udp_socket().await;
+            let client = udp_socket().await;
+            let client_addr = client.local_addr().unwrap();
+            let mut cfg = config(upstream.local_addr().unwrap());
+            if let Some(timeout) = configured {
+                cfg.idle_timeout = timeout;
+            }
+            let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+            forwarder
+                .forward_packet(client_addr, b"initial")
+                .await
+                .unwrap();
+            receive(&upstream).await;
+
+            time::pause();
+            let timeout = configured.unwrap_or(Duration::from_secs(60));
+            time::advance(timeout - Duration::from_secs(1)).await;
+            assert!(!forwarder.sessions[&client_addr].activity.is_closed());
+            time::advance(Duration::from_secs(2)).await;
+            let result = forwarder.tasks.join_next_with_id().await.unwrap();
+            forwarder.reap_session(result);
+            assert!(forwarder.sessions.is_empty());
+            time::resume();
+        }
+    }
+
+    #[tokio::test]
     async fn recreates_expired_mapping_before_old_task_is_reaped() {
         let upstream = udp_socket().await;
         let client = udp_socket().await.local_addr().unwrap();

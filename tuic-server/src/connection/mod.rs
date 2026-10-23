@@ -299,6 +299,12 @@ mod tests {
     };
     use std::{future::Future, net::Ipv4Addr};
     use tokio::time::{self, timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    use tuic::Address;
     use tuic_quinn::{side, Connection as ModelConnection, Task};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -484,5 +490,49 @@ mod tests {
         assert_eq!(diagnostics.active_udp_associations, 0);
         assert_eq!(diagnostics.udp_sessions, 0);
         assert!(diagnostics.stats.udp_rx.datagrams > 0);
+    }
+
+    #[tokio::test]
+    async fn completed_tcp_relay_preserves_the_response_and_graceful_eof() {
+        let fixture = Fixture::new().await;
+        let listener = TcpListener::bind(loopback()).await.unwrap();
+        let mut relay = bounded(
+            fixture
+                .client
+                .connect(Address::SocketAddress(listener.local_addr().unwrap())),
+        )
+        .await
+        .unwrap()
+        .compat();
+        let (send, recv) = bounded(fixture.server.inner.accept_bi()).await.unwrap();
+        let Task::Connect(conn) = bounded(fixture.server.model.accept_bi_stream(send, recv))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a Connect task");
+        };
+        let response = vec![0x5a; 256 * 1024];
+        bounded(async {
+            let destination = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"request");
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            };
+            let client = async {
+                relay.write_all(b"request").await.unwrap();
+                relay.shutdown().await.unwrap();
+            };
+            tokio::join!(fixture.server.handle_connect(conn), destination, client);
+            let mut received = Vec::new();
+            relay
+                .read_to_end(&mut received)
+                .await
+                .expect("a completed relay must end with EOF, not a stream reset");
+            assert_eq!(received, response);
+        })
+        .await;
     }
 }

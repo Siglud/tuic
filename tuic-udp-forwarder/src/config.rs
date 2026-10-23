@@ -211,6 +211,8 @@ mod tests {
         for (field, value) in [
             ("server", json!("not-an-address")),
             ("idle_timeout", json!("0s")),
+            ("idle_timeout", json!("")),
+            ("idle_timeout", json!(null)),
             ("idle_timeout", json!("eventually")),
             ("max_clients", json!(0)),
             ("max_clients", json!(-1)),

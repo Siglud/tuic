@@ -110,6 +110,7 @@ garbage collection.
         "timeout": "8s",
 
         // Optional. Heartbeat interval duration string; use a positive interval.
+        // Sent only while TCP relay tasks or UDP associations are active.
         // Default: "3s"
         "heartbeat": "3s",
 
@@ -209,6 +210,25 @@ Do not set `relay.ip` when using `relay.forwarder_server`; the client rejects
 configurations that set both. Existing configurations without `forwarder_server`
 keep their previous behavior, including `relay.ip` DNS overrides. Forwarder
 failures do not cause a fallback to a direct connection to the real server.
+
+## Connection cleanup and logging
+
+An idle relay connection may expire using the server's `max_idle_time`
+(default `"10s"`). Heartbeats stop when no TCP relay tasks or UDP associations
+remain; the next proxy request establishes a new connection. Idle expiration
+with no active tasks is logged at `info`, and local connection closure at
+`debug`. A timeout while tasks are still active remains a warning.
+
+QUIC stream resets or stop requests with application code `0`, used for stream
+cleanup by older TUIC servers, are logged at `info` for SOCKS5, HTTP CONNECT,
+and plain HTTP relaying. Nonzero stream codes, TCP socket resets (including
+Windows error 10054), and other relay failures remain warnings because they
+are not confirmed normal cleanup. Updated servers finish successful TCP relays
+gracefully instead of resetting them.
+
+The forwarder's `idle_timeout` only expires UDP mappings; it does not override
+the server's QUIC timeout. See the
+[forwarder timeout explanation](../tuic-udp-forwarder/README.md#idle-timeout-versus-quic-connection-lifetime).
 
 ## License
 

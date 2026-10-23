@@ -1,5 +1,8 @@
 use super::write_http_response;
-use crate::connection::{Connection as TuicConnection, ERROR_CODE};
+use crate::{
+    connection::{Connection as TuicConnection, ERROR_CODE},
+    error::stream_error_log_level,
+};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tokio::{
     io::{self, AsyncWriteExt},
@@ -49,7 +52,8 @@ pub async fn handle_connect(mut stream: TcpStream, peer_addr: SocketAddr, target
                 Err(err) => {
                     let _ = stream.shutdown().await;
                     let _ = relay.get_mut().reset(ERROR_CODE);
-                    log::warn!(
+                    log::log!(
+                        stream_error_log_level(&err),
                         "[http] [{peer_addr}] [connect] [{tuic_addr}] TCP stream relaying error: {err}"
                     );
                 }
@@ -122,7 +126,8 @@ pub async fn handle_request(
                 Err(err) => {
                     let _ = stream.shutdown().await;
                     let _ = relay.get_mut().reset(ERROR_CODE);
-                    log::warn!(
+                    log::log!(
+                        stream_error_log_level(&err),
                         "[http] [{peer_addr}] [request] [{tuic_addr}] TCP stream relaying error: {err}"
                     );
                 }

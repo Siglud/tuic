@@ -218,7 +218,11 @@ impl Connection {
             };
         };
 
-        log::warn!("[relay] connection error: {err}");
+        let active_tasks = self.model.task_connect_count() + self.model.task_associate_count();
+        log::log!(
+            err.connection_log_level(active_tasks),
+            "[relay] connection ended: {err}; active_tasks={active_tasks}"
+        );
     }
 
     fn is_closed(&self) -> bool {
