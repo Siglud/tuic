@@ -32,8 +32,20 @@ The root of the protocol abstraction is the [`Header`](src/protocol/mod.rs).
 To avoid breaking changes, import `tuic` into `Cargo.toml` using:
 
 ```toml
+# Use this repository's main branch, with TUIC protocol version 5.
 tuic = { git = "https://github.com/Siglud/tuic", branch = "main", version = "5.0.*" }
 ```
+
+## Configuration
+
+This protocol library is configured through its Rust API and does not read
+configuration files. For runnable tools, see the
+[main usage guide](../README.md#usage) and the commented configuration references
+for the [client](../tuic-client/README.md#configuration),
+[server](../tuic-server/README.md#configuration), and
+[UDP forwarder](../tuic-udp-forwarder/README.md#configuration). All three tools
+parse config files as JSONC regardless of extension, including `.json`, with
+line/block comments and trailing commas supported. Plain JSON remains valid.
 
 ## License
 

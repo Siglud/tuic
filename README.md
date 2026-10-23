@@ -73,20 +73,31 @@ Application -> tuic-client -> tuic-udp-forwarder -> tuic-server -> destination
 The examples below use `exit.example.com` for the real TUIC server and
 `forwarder.example.com` for the optional forwarding machine. Replace these names,
 the example IP addresses, UUID, and password with your own values. Configuration
-files must be valid JSON without comments.
+files are always parsed as **JSONC**, regardless of their extension (including
+`.json`, `.jsonc`, or no extension). Plain JSON remains valid. You can use `//`
+line comments, `/* ... */` block comments, and trailing commas in objects and
+arrays. Property names and string values still require double quotes; JSON5
+features such as single quotes and unquoted property names are not supported.
+Unknown properties and invalid values are rejected.
 
 ### Start the server
 
 On the exit machine, create `server.json`:
 
-```json
+```jsonc
 {
+    // Required. UDP listening IP and port; use "[::]:443" for IPv6.
     "server": "0.0.0.0:443",
+    // Required. Nonempty map of user UUIDs to passwords.
     "users": {
+        // Replace the UUID key and password; the client must use the same pair.
         "00000000-0000-0000-0000-000000000000": "REPLACE_WITH_A_STRONG_PASSWORD"
     },
+    // Required. TLS certificate chain path (PEM, or a single DER certificate).
     "certificate": "server-cert.pem",
+    // Required. Matching private key path (PEM or PKCS#8 DER); keep it secret.
     "private_key": "server-key.pem",
+    // Optional. ALPN strings; match the client. Default: [] (no ALPN).
     "alpn": ["tuic"]
 }
 ```
@@ -108,16 +119,24 @@ for all settings.
 
 On your local machine, create `client.json`:
 
-```json
+```jsonc
 {
+    // Required. Outbound TUIC connection settings.
     "relay": {
+        // Required. Real TUIC server HOST:PORT; hostname must match its TLS certificate.
         "server": "exit.example.com:443",
+        // Required. User UUID configured on the server.
         "uuid": "00000000-0000-0000-0000-000000000000",
+        // Required. Password associated with that UUID on the server.
         "password": "REPLACE_WITH_A_STRONG_PASSWORD",
+        // Optional. ALPN strings; match the server. Default: [] (no ALPN).
         "alpn": ["tuic"]
     },
+    // Required. Local SOCKS5 and optional HTTP proxy settings.
     "local": {
+        // Required. Listening IP and port; loopback restricts access to this machine.
         "server": "127.0.0.1:1080",
+        // Optional. Enable HTTP proxy on the SOCKS5 port. Default: false.
         "enable_http": true
     }
 }
@@ -154,11 +173,15 @@ for authentication, TLS, UDP modes, and other options.
 On the forwarding machine, create `forwarder.json`. This example sends all
 received datagrams to the exit server at `203.0.113.10:443`:
 
-```json
+```jsonc
 {
+    // Required. UDP listening IP and port on the forwarding machine.
     "server": "0.0.0.0:8443",
+    // Required. Fixed upstream HOST:PORT; bracket IPv6 addresses as "[ADDRESS]:PORT".
     "upstream": "203.0.113.10:443",
+    // Optional. Positive mapping idle duration; keep above the heartbeat interval. Default: "60s".
     "idle_timeout": "60s",
+    // Optional. Positive integer limit on simultaneous client IP/port mappings. Default: 1024.
     "max_clients": 1024
 }
 ```
@@ -176,17 +199,26 @@ back to each client.
 
 Update `client.json` to use the forwarder, then restart the client:
 
-```json
+```jsonc
 {
+    // Required. Outbound TUIC connection settings.
     "relay": {
+        // Required. Real TUIC server HOST:PORT, still used for TLS verification/SNI.
         "server": "exit.example.com:443",
+        // Optional. Forwarder HOST:PORT (port 1-65535); cannot be combined with relay.ip.
         "forwarder_server": "forwarder.example.com:8443",
+        // Required. User UUID configured on the real TUIC server.
         "uuid": "00000000-0000-0000-0000-000000000000",
+        // Required. Password associated with that UUID on the real server.
         "password": "REPLACE_WITH_A_STRONG_PASSWORD",
+        // Optional. ALPN strings; match the real server. Default: [] (no ALPN).
         "alpn": ["tuic"]
     },
+    // Required. Local SOCKS5 and optional HTTP proxy settings.
     "local": {
+        // Required. Listening IP and port; loopback restricts access to this machine.
         "server": "127.0.0.1:1080",
+        // Optional. Enable HTTP proxy on the SOCKS5 port. Default: false.
         "enable_http": true
     }
 }

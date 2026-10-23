@@ -9,7 +9,7 @@ const HELP_MSG: &str = r#"
 Usage tuic-udp-forwarder [arguments]
 
 Arguments:
-    -c, --config <path>     Path to the config file (required)
+    -c, --config <path>     Path to the JSONC config file (any extension, required)
     -v, --version           Print the version
     -h, --help              Print this help message
 "#;
@@ -54,7 +54,7 @@ impl Config {
         }
 
         let file = File::open(path.ok_or(ConfigError::NoConfig)?)?;
-        Ok(serde_json::from_reader(file)?)
+        Ok(serde_json_lenient::from_reader(file)?)
     }
 }
 
@@ -95,7 +95,7 @@ pub enum ConfigError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    Serde(#[from] serde_json::Error),
+    Serde(#[from] serde_json_lenient::Error),
 }
 
 #[cfg(test)]
@@ -103,10 +103,80 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
-    use tempfile::NamedTempFile;
+    use tempfile::{Builder, NamedTempFile};
 
     fn minimal_config() -> serde_json::Value {
         json!({"server": "127.0.0.1:0", "upstream": "localhost:443"})
+    }
+
+    fn parse_text_file(text: &str, suffix: &str) -> Result<Config, ConfigError> {
+        let file = Builder::new().suffix(suffix).tempfile().unwrap();
+        fs::write(file.path(), text).unwrap();
+        Config::parse(vec![
+            OsString::from("forwarder"),
+            OsString::from("--config"),
+            file.path().as_os_str().to_owned(),
+        ])
+    }
+
+    #[test]
+    fn cli_loads_jsonc_regardless_of_extension() {
+        let text = r#"
+        /* Forwarder configuration */
+        {
+            "server": "127.0.0.1:0", // UDP listener
+            "upstream": "localhost:443",
+            "idle_timeout": /* Inline comment */ "1250ms",
+        } // No final newline"#;
+
+        for suffix in [".json", ".jsonc", ".conf", ""] {
+            let config = parse_text_file(text, suffix).unwrap();
+            assert_eq!(config.server, "127.0.0.1:0".parse().unwrap());
+            assert_eq!(config.upstream, "localhost:443");
+            assert_eq!(config.idle_timeout, Duration::from_millis(1250));
+            assert_eq!(config.max_clients.get(), 1024);
+            assert_eq!(config.log_level, LevelFilter::Warn);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_malformed_jsonc() {
+        let valid = minimal_config().to_string();
+        for text in [
+            "{ invalid".to_string(),
+            format!("{valid} /* unterminated"),
+            format!("{valid}\n{{}}"),
+            valid.replace("\"upstream\":", "\"upstream\" /* missing colon */"),
+            valid.replace("\"server\":", "server:"),
+            valid.replacen("\"server\"", "'server'", 1),
+        ] {
+            match parse_text_file(&text, ".json") {
+                Err(ConfigError::Serde(error)) => {
+                    assert!(error.line() > 0);
+                    assert!(error.column() > 0);
+                }
+                _ => panic!("expected a JSONC parsing error"),
+            }
+        }
+    }
+
+    #[test]
+    fn readme_configurations_are_valid_jsonc() {
+        let mut examples = 0;
+        for readme in [
+            include_str!("../README.md"),
+            include_str!("../../README.md"),
+        ] {
+            for block in readme.split("```jsonc").skip(1) {
+                let text = block.split_once("```").unwrap().0;
+                let value: serde_json_lenient::Value = serde_json_lenient::from_str(text).unwrap();
+                if value.get("upstream").is_some() {
+                    parse_text_file(text, ".json").unwrap();
+                    examples += 1;
+                }
+            }
+        }
+        assert_eq!(examples, 2);
     }
 
     #[test]

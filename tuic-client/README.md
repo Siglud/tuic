@@ -34,130 +34,148 @@ For a complete server/client/forwarder setup, see the
 
 ## Configuration
 
-```json5
+All configuration files are parsed as **JSONC**, even when named `client.json`
+or given another extension (or none). Plain JSON, `//` line comments,
+`/* ... */` block comments, and trailing commas in objects and arrays are
+supported. Use double-quoted property names and strings, not JSON5 single quotes
+or unquoted names. Unknown properties and invalid values are rejected.
+
+Required settings are marked below; omit optional properties to use their
+defaults. Relative file paths are resolved from the process's working directory,
+not the configuration file's directory. Durations are human-readable strings
+such as `"250ms"`, `"3s"`, or `"1m"`; use positive intervals for heartbeat and
+garbage collection.
+
+```jsonc
 {
-    // Settings for the outbound TUIC proxy
+    // Required. Settings for the outbound TUIC connection.
     "relay": {
-        // Set the TUIC proxy server address
-        // Format: "HOST:PORT"
-        // The HOST must be a common name in the certificate
-        // With neither "ip" nor "forwarder_server" set, HOST is also used for DNS resolving
+        // Required. Real TUIC server HOST:PORT, with a port from 1 to 65535.
+        // Use "[ADDRESS]:PORT" for IPv6; HOST must match the TLS certificate.
+        // Without "ip" or "forwarder_server", HOST is also resolved for the connection.
         "server": "example.com:443",
 
-        // Set the user UUID
+        // Required. User UUID registered in the TUIC server's "users" map.
         "uuid": "00000000-0000-0000-0000-000000000000",
 
-        // Set the user password
+        // Required. Password string associated with that UUID on the server.
         "password": "PASSWORD",
 
-        // Optional. The IP address of the TUIC proxy server, for overriding DNS resolving
-        // For forwarding, use "forwarder_server" instead
-        // Cannot be combined with a non-null "forwarder_server"
+        // Optional. IPv4 or IPv6 address string without a port, overriding DNS.
+        // The port still comes from "server"; omit or use null for normal DNS.
+        // Cannot be combined with a non-null "forwarder_server".
         "ip": null,
 
         // Optional. Connect through a UDP forwarder, e.g. "forwarder.example.com:8443"
-        // Format: "HOST:PORT"; use "[ADDRESS]:PORT" for an IPv6 address
+        // Format: "HOST:PORT", port 1-65535; use "[ADDRESS]:PORT" for IPv6.
         // The "server" field still identifies the real TUIC server for TLS/SNI
         // Both the forwarder's hostname/IP and port are independent of "server"
-        // Cannot be combined with a non-null "ip"
+        // Omit or use null for a direct connection; cannot be combined with a non-null "ip".
         "forwarder_server": null,
 
-        // Optional. A list of certificates for TLS handshake
-        // System native certificates are also loaded by default
-        // When using self-signed certificates, the full certificate chain must be provided
+        // Optional. List of trusted TLS certificate file paths (PEM or DER). Default: [].
+        // System native certificates are also loaded unless "disable_native_certs" is true.
+        // For a private CA/self-signed certificate, provide the required certificate chain.
         "certificates": ["PATH/TO/CERTIFICATE_1", "PATH/TO/CERTIFICATE_2"],
 
-        // Optional. Set the UDP packet relay mode
+        // Optional. UDP relay mode string (case-insensitive).
         // Can be:
         // - "native": native UDP characteristics
         // - "quic": lossless UDP relay using QUIC streams, additional overhead is introduced
         // Default: "native"
         "udp_relay_mode": "native",
 
-        // Optional. Congestion control algorithm, available options:
-        // "cubic", "new_reno", "bbr"
+        // Optional. Congestion control algorithm string (case-insensitive):
+        // "cubic", "new_reno" (alias "newreno"), or "bbr".
         // Default: "cubic"
         "congestion_control": "cubic",
 
-        // Optional. Application layer protocol negotiation
-        // Default being empty (no ALPN)
+        // Optional. List of ALPN strings; match the server's supported protocols.
+        // Default: [] (no ALPN).
         "alpn": ["h3", "spdy/3.1"],
 
-        // Optional. Enable 0-RTT QUIC connection handshake on the client side
+        // Optional boolean. Enable 0-RTT QUIC connection handshake on the client side.
         // This is not impacting much on the performance, as the protocol is fully multiplexed
         // WARNING: Disabling this is highly recommended, as it is vulnerable to replay attacks. See https://blog.cloudflare.com/even-faster-connection-establishment-with-quic-0-rtt-resumption/#attack-of-the-clones
         // Default: false
         "zero_rtt_handshake": false,
 
-        // Optional. Disable SNI (Server Name Indication) in TLS handshake
+        // Optional boolean. Disable SNI (Server Name Indication) in TLS handshake.
         // The server name used in SNI is the same as the HOST in the "server" field
         // Default: false
         "disable_sni": false,
 
-        // Optional. Set the timeout for establishing a connection to the TUIC proxy server
+        // Optional. Connection timeout duration string, e.g. "8s" or "1250ms".
         // Default: "8s"
         "timeout": "8s",
 
-        // Optional. Set the interval for sending heartbeat packets for keeping the connection alive
+        // Optional. Heartbeat interval duration string; use a positive interval.
         // Default: "3s"
         "heartbeat": "3s",
 
-        // Optional. Disable loading system native certificates
+        // Optional boolean. Disable loading system native certificates.
+        // If true, supply trust anchors through "certificates".
         // Default: false
         "disable_native_certs": false,
 
         // Optional. Maximum number of bytes to transmit to a peer without acknowledgment
+        // Nonnegative integer fitting in u64.
         // Should be set to at least the expected connection latency multiplied by the maximum desired throughput
         // Default: 8MiB * 2
         "send_window": 16777216,
 
         // Optional. Maximum number of bytes the peer may transmit without acknowledgement on any one stream before becoming blocked
+        // Integer from 0 to 4294967295 (u32), in bytes.
         // Should be set to at least the expected connection latency multiplied by the maximum desired throughput
         // Larger values improve high-bandwidth, high-latency throughput but increase out-of-order reassembly pressure
         // Default: 1MiB
         "receive_window": 1048576,
 
-        // Optional. Interval between UDP packet fragment garbage collection
-        // Default: 3s
+        // Optional. Positive duration string between UDP fragment garbage collections.
+        // Default: "3s".
         "gc_interval": "3s",
 
-        // Optional. How long the server should keep a UDP packet fragment. Outdated fragments will be dropped
-        // Default: 15s
+        // Optional. Duration string for retaining incomplete UDP fragments on the client.
+        // Older fragments are dropped. Default: "15s".
         "gc_lifetime": "15s"
     },
 
-    // Settings for the local proxy server
+    // Required. Settings for the local proxy server.
     "local": {
-        // Local proxy server address
+        // Required. Listening IP:PORT, or "[ADDRESS]:PORT" for IPv6; not a hostname.
+        // Port range: 0-65535 (0 requests an OS-assigned port).
         // Both SOCKS5 and HTTP proxy listen on this single port when "enable_http" is true
         "server": "[::]:1080",
 
-        // Optional. Set the username for proxy authentication
+        // Optional. Proxy authentication username string; set together with "password".
+        // Omit both credentials to disable local proxy authentication.
         // Applies to both SOCKS5 (password auth) and HTTP (Proxy-Authorization: Basic)
         "username": "USERNAME",
 
-        // Optional. Set the password for proxy authentication
+        // Optional. Proxy authentication password string; set together with "username".
         // Applies to both SOCKS5 (password auth) and HTTP (Proxy-Authorization: Basic)
         "password": "PASSWORD",
 
-        // Optional. Enable HTTP proxy on the same port as SOCKS5
+        // Optional boolean. Enable HTTP proxy on the same port as SOCKS5.
         // When enabled, the server automatically detects whether each incoming connection
         // is a SOCKS5 connection (first byte 0x05) or an HTTP proxy request, and handles
         // it accordingly. Both protocols share the same username/password credentials.
         // Default: false
         "enable_http": false,
 
-        // Optional. Set if the listening socket should be dual-stack (e.g. an IPv6
-        // listening address also accepts IPv4 connections when supported by the OS)
-        // If this option is not set, the socket behavior is platform dependent
+        // Optional boolean. For an IPv6 listener, true also accepts IPv4 where supported;
+        // false restricts it to IPv6. Only set this with an IPv6 listening address.
+        // Omit or use null for the OS default.
         "dual_stack": true,
-        // Optional. Maximum packet size the SOCKS5 server can receive from external, in bytes
+
+        // Optional. Nonnegative integer fitting in usize: receive buffer size in bytes.
+        // UDP packets larger than the buffer may be truncated; choose a positive size.
         // Note: ignored for HTTP proxy connections
         // Default: 1500
         "max_packet_size": 1500
     },
 
-    // Optional. Set the log level
+    // Optional. Log level: "off", "error", "warn", "info", "debug", or "trace".
     // Default: "warn"
     "log_level": "warn"
 }

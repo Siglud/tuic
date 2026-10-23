@@ -28,7 +28,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 rustls-native-certs = { version = "0.8.4", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+serde_json_lenient = { version = "0.2.4", default-features = false, features = ["std"] }
 socket2 = { version = "0.6.5", default-features = false }
 socks5-proto = { version = "0.4.1", default-features = false }
 socks5-server = { version = "0.10.1", default-features = false }
@@ -41,4 +41,5 @@ uuid = { version = "1.28.0", default-features = false, features = ["serde", "std
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 tempfile = "3.27.0"

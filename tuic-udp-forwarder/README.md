@@ -22,18 +22,42 @@ Build with Rust 1.89.0 or newer:
 cargo build --release -p tuic-udp-forwarder --locked
 ```
 
-Run with a JSON configuration file:
+Run with a JSONC configuration file (a `.json` filename is fine):
 
 ```sh
 tuic-udp-forwarder -c forwarder.json
 ```
 
-Minimal configuration:
+## Configuration
 
-```json
+All config files are parsed as **JSONC**, regardless of extension (including no
+extension). Plain JSON, `//` line comments, `/* ... */` block comments, and
+trailing commas in objects and arrays are supported. Use double-quoted property
+names and strings; other JSON5 syntax is not supported. Unknown properties and
+invalid values are rejected.
+
+Complete configuration (only `server` and `upstream` are required):
+
+```jsonc
 {
+    // Required. UDP listening IP:PORT; use "[ADDRESS]:PORT" for IPv6.
+    // Port range: 0-65535 (0 requests an OS-assigned port); not a hostname.
     "server": "0.0.0.0:8443",
-    "upstream": "203.0.113.10:443"
+    // Required. Fixed upstream HOST:PORT; use "[ADDRESS]:PORT" for IPv6.
+    // HOST may be an IP address or domain; use a reachable UDP service port.
+    "upstream": "203.0.113.10:443",
+    // Optional boolean. For an IPv6 listener, true also accepts IPv4 where supported;
+    // false restricts it to IPv6. Omit or use null for the OS default; ignored for IPv4.
+    "dual_stack": null,
+    // Optional. Positive duration string fitting in a timer, e.g. "1250ms" or "1m".
+    // Activity in either direction keeps the mapping alive. Default: "60s".
+    "idle_timeout": "60s",
+    // Optional. Positive integer fitting in usize: maximum simultaneous client mappings.
+    // Default: 1024.
+    "max_clients": 1024,
+    // Optional. Log level: "off", "error", "warn", "info", "debug", or "trace".
+    // Default: "warn".
+    "log_level": "warn"
 }
 ```
 
@@ -69,15 +93,22 @@ Keep the real TUIC server's TLS hostname, trust settings, ALPN, UUID, and passwo
 Keep `relay.server` set to the real server's hostname and original port.
 Set `relay.forwarder_server` to the forwarder's hostname/IP and listening port:
 
-```json
+```jsonc
 {
+    // Required. Outbound TUIC connection settings on the client, not the forwarder.
     "relay": {
+        // Required. Real TUIC server HOST:PORT (port 1-65535), used for TLS verification/SNI.
         "server": "exit.example.com:443",
+        // Optional. Forwarder HOST:PORT (port 1-65535); cannot be combined with relay.ip.
         "forwarder_server": "198.51.100.20:8443",
+        // Required. User UUID configured on the real TUIC server.
         "uuid": "00000000-0000-0000-0000-000000000000",
+        // Required. Password associated with that UUID on the real server.
         "password": "PASSWORD"
     },
+    // Required. Local proxy settings.
     "local": {
+        // Required. Listening IP:PORT; loopback restricts proxy access to this machine.
         "server": "127.0.0.1:1080"
     }
 }
