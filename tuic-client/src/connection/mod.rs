@@ -259,6 +259,15 @@ struct Endpoint {
 impl Endpoint {
     async fn connect(&mut self) -> Result<Connection, Error> {
         let addresses = self.server.resolve().await?.collect();
+        // Bind before replacing the old endpoint so retries cannot reuse its stale UDP mapping.
+        let socket = UdpSocket::bind(wildcard_addr_for(self.ep.local_addr()?))
+            .map_err(|err| Error::Socket("failed to create endpoint UDP socket", err))?;
+        self.ep = QuinnEndpoint::new(
+            EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        )?;
         let (ep, conn, zero_rtt_accepted) = connect_addresses(
             self.ep.clone(),
             self.config.clone(),
@@ -327,6 +336,7 @@ async fn connect_addresses(
                                 Arc::new(TokioRuntime),
                             )?
                         };
+                        log::debug!("[relay] connecting to {addr} from {}", endpoint.local_addr()?);
                         let conn = endpoint.connect_with(config, addr, &server_name)?;
                         let (conn, accepted) = if zero_rtt {
                             match conn.into_0rtt() {
@@ -521,6 +531,113 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_recovers_when_the_previous_udp_mapping_is_blackholed() {
+        let (server_config, client_config) = quic_configs();
+        let server = QuinnEndpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let forwarder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forwarder_addr = forwarder.local_addr().unwrap();
+        let (blocked, blocked_rx) = tokio::sync::watch::channel(None::<SocketAddr>);
+        let forwarding = tokio::spawn(async move {
+            let mut buffer = [0; 65535];
+            let mut client = None;
+            loop {
+                let (len, source) = forwarder.recv_from(&mut buffer).await.unwrap();
+                if source == server_addr {
+                    if let Some(client) = client {
+                        forwarder.send_to(&buffer[..len], client).await.unwrap();
+                    }
+                } else if Some(source) != *blocked_rx.borrow() {
+                    client = Some(source);
+                    forwarder
+                        .send_to(&buffer[..len], server_addr)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let mut endpoint = Endpoint {
+            ep: QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap(),
+            config: client_config,
+            server: ServerAddr::new(
+                "localhost".to_string(),
+                server_addr.port(),
+                None,
+                Some((forwarder_addr.ip().to_string(), forwarder_addr.port())),
+            )
+            .unwrap(),
+            uuid: Uuid::nil(),
+            password: Arc::from(b"test-password".as_slice()),
+            udp_relay_mode: UdpRelayMode::Native,
+            zero_rtt_handshake: false,
+            heartbeat: Duration::from_secs(3),
+            gc_interval: Duration::from_secs(3),
+            gc_lifetime: Duration::from_secs(15),
+        };
+        let accept = async { server.accept().await.unwrap().await.unwrap() };
+        let (first, incoming) = time::timeout(Duration::from_secs(3), async {
+            tokio::join!(endpoint.connect(), accept)
+        })
+        .await
+        .expect("initial relay connection timed out");
+        let first = first.unwrap();
+        let first_port = endpoint.ep.local_addr().unwrap().port();
+        first.conn.close(ERROR_CODE, b"reconnect test");
+        time::timeout(Duration::from_secs(3), incoming.closed())
+            .await
+            .expect("initial relay connection did not close");
+        blocked.send_replace(Some(SocketAddr::from((Ipv4Addr::LOCALHOST, first_port))));
+
+        let accept = async { server.accept().await.unwrap().await.unwrap() };
+        let (second, _incoming) = time::timeout(Duration::from_secs(3), async {
+            tokio::join!(endpoint.connect(), accept)
+        })
+        .await
+        .expect("reconnect reused the blackholed UDP mapping");
+        let second = second.unwrap();
+        assert_ne!(endpoint.ep.local_addr().unwrap().port(), first_port);
+        second.conn.close(ERROR_CODE, b"test complete");
+        forwarding.abort();
+        assert!(forwarding.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_connection_attempts_refresh_the_udp_socket() {
+        let (_, config) = quic_configs();
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        let mut endpoint = Endpoint {
+            ep: QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap(),
+            config,
+            server: ServerAddr::new(
+                "localhost".to_string(),
+                blackhole_addr.port(),
+                Some(Ipv4Addr::LOCALHOST.into()),
+                None,
+            )
+            .unwrap(),
+            uuid: Uuid::nil(),
+            password: Arc::from(b"test-password".as_slice()),
+            udp_relay_mode: UdpRelayMode::Native,
+            zero_rtt_handshake: false,
+            heartbeat: Duration::from_secs(3),
+            gc_interval: Duration::from_secs(3),
+            gc_lifetime: Duration::from_secs(15),
+        };
+        let mut previous_port = endpoint.ep.local_addr().unwrap().port();
+        for _ in 0..2 {
+            assert!(
+                time::timeout(Duration::from_millis(200), endpoint.connect())
+                    .await
+                    .is_err()
+            );
+            let port = endpoint.ep.local_addr().unwrap().port();
+            assert_ne!(port, previous_port, "retry reused the failed UDP socket");
+            previous_port = port;
+        }
     }
 
     #[tokio::test]

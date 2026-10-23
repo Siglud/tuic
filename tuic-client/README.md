@@ -219,6 +219,12 @@ remain; the next proxy request establishes a new connection. Idle expiration
 with no active tasks is logged at `info`, and local connection closure at
 `debug`. A timeout while tasks are still active remains a warning.
 
+Each new relay connection uses a fresh UDP socket and source port, including
+retries after a connection-establishment timeout. This avoids repeatedly reusing
+a stale NAT or UDP-forwarder mapping. Established connections continue to share
+their existing socket; TLS settings and the configured relay destination are
+unchanged. Debug logging includes each attempted destination and local socket.
+
 QUIC stream resets or stop requests with application code `0`, used for stream
 cleanup by older TUIC servers, are logged at `info` for SOCKS5, HTTP CONNECT,
 and plain HTTP relaying. Nonzero stream codes, TCP socket resets (including
