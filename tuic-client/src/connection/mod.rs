@@ -50,6 +50,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn set_config(cfg: Relay) -> Result<(), Error> {
+        let server = ServerAddr::new(cfg.server.0, cfg.server.1, cfg.ip, cfg.forwarder_server)?;
         let certs = utils::load_certs(cfg.certificates, cfg.disable_native_certs)?;
 
         let mut crypto = RustlsClientConfig::builder_with_protocol_versions(&[&version::TLS13])
@@ -104,7 +105,7 @@ impl Connection {
 
         let ep = Endpoint {
             ep,
-            server: ServerAddr::new(cfg.server.0, cfg.server.1, cfg.ip),
+            server,
             uuid: cfg.uuid,
             password: cfg.password,
             udp_relay_mode: cfg.udp_relay_mode,
@@ -316,6 +317,23 @@ fn wildcard_addr_for(remote: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_forwarder_and_ip_before_initializing_endpoint() {
+        let cfg: Relay = serde_json::from_value(serde_json::json!({
+            "server": "relay.example:443",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "password": "secret",
+            "ip": "192.0.2.10",
+            "forwarder_server": "192.0.2.20:8443"
+        }))
+        .unwrap();
+        let error = Connection::set_config(cfg).unwrap_err();
+        assert!(matches!(error, Error::ConflictingRelayAddresses));
+        assert!(error
+            .to_string()
+            .contains("relay.forwarder_server and relay.ip cannot both be set"));
+    }
 
     #[test]
     fn endpoint_family_helpers_select_matching_wildcard_bindings() {

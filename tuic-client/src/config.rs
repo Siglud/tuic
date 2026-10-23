@@ -10,7 +10,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::Error as IoError,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     str::FromStr,
     sync::Arc,
@@ -51,6 +51,9 @@ pub struct Relay {
     pub password: Arc<[u8]>,
 
     pub ip: Option<IpAddr>,
+
+    #[serde(default, deserialize_with = "deserialize_optional_server")]
+    pub forwarder_server: Option<(String, u16)>,
 
     #[serde(default = "default::relay::certificates")]
     pub certificates: Vec<PathBuf>,
@@ -257,23 +260,47 @@ pub fn deserialize_server<'de, D>(deserializer: D) -> Result<(String, u16), D::E
 where
     D: Deserializer<'de>,
 {
-    let mut s = String::deserialize(deserializer)?;
+    parse_server(&String::deserialize(deserializer)?).map_err(DeError::custom)
+}
 
-    let (domain, port) = s
-        .rsplit_once(':')
-        .ok_or(DeError::custom("invalid server address"))?;
+fn deserialize_optional_server<'de, D>(deserializer: D) -> Result<Option<(String, u16)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| parse_server(&value))
+        .transpose()
+        .map_err(DeError::custom)
+}
+
+fn parse_server(value: &str) -> Result<(String, u16), &'static str> {
+    let (domain, port) = value.rsplit_once(':').ok_or("invalid server address")?;
+
+    let domain = if let Some(address) = domain.strip_prefix('[') {
+        let address = address
+            .strip_suffix(']')
+            .ok_or("invalid IPv6 server address")?;
+        address
+            .parse::<Ipv6Addr>()
+            .map_err(|_| "invalid IPv6 server address")?;
+        address
+    } else {
+        if domain.contains([':', '[', ']']) {
+            return Err("IPv6 server addresses must use [ADDRESS]:PORT");
+        }
+        domain
+    };
 
     if domain.is_empty() {
-        return Err(DeError::custom("invalid server address"));
+        return Err("invalid server address");
     }
 
-    let port = port.parse().map_err(DeError::custom)?;
+    let port = port.parse().map_err(|_| "invalid server port")?;
     if port == 0 {
-        return Err(DeError::custom("invalid server port"));
+        return Err("invalid server port");
     }
-    s.truncate(domain.len());
 
-    Ok((s, port))
+    Ok((domain.to_string(), port))
 }
 
 pub fn deserialize_password<'de, D>(deserializer: D) -> Result<Arc<[u8]>, D::Error>
@@ -415,6 +442,7 @@ mod tests {
         assert_eq!(config.relay.uuid, Uuid::parse_str(UUID).unwrap());
         assert_eq!(config.relay.password.as_ref(), b"secret");
         assert_eq!(config.relay.ip, None);
+        assert_eq!(config.relay.forwarder_server, None);
         assert!(config.relay.certificates.is_empty());
         assert!(matches!(config.relay.udp_relay_mode, UdpRelayMode::Native));
         assert!(matches!(
@@ -519,6 +547,47 @@ mod tests {
             Some("us\u{e9}r".as_bytes())
         );
         assert_eq!(config.local.password.as_deref(), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn forwarder_server_accepts_hostnames_ip_addresses_and_null() {
+        for (input, expected_host) in [
+            ("forwarder.example:8443", "forwarder.example"),
+            ("192.0.2.20:8443", "192.0.2.20"),
+            ("[2001:db8::20]:8443", "2001:db8::20"),
+        ] {
+            let mut value = minimal_config();
+            value["relay"]["forwarder_server"] = json!(input);
+            let config = parse_file(&value).unwrap();
+            assert_eq!(
+                config.relay.forwarder_server,
+                Some((expected_host.to_string(), 8443))
+            );
+            assert_eq!(config.relay.server, ("example.com".to_string(), 443));
+        }
+        let mut value = minimal_config();
+        value["relay"]["forwarder_server"] = Value::Null;
+        assert_eq!(parse_file(&value).unwrap().relay.forwarder_server, None);
+    }
+
+    #[test]
+    fn forwarder_server_rejects_invalid_addresses() {
+        for invalid in [
+            json!(""),
+            json!("forwarder.example"),
+            json!(":8443"),
+            json!("forwarder.example:0"),
+            json!("forwarder.example:65536"),
+            json!("forwarder.example:port"),
+            json!("::1:8443"),
+            json!("[::1:8443"),
+            json!("[not-ipv6]:8443"),
+            json!(1234),
+        ] {
+            let mut value = minimal_config();
+            value["relay"]["forwarder_server"] = invalid;
+            assert!(matches!(parse_file(&value), Err(ConfigError::Serde(_))));
+        }
     }
 
     #[test]

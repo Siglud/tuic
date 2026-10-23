@@ -33,7 +33,7 @@ static PAYLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 #[ignore = "requires prebuilt workspace binaries"]
-fn cli_smoke_for_client_and_server() {
+fn cli_smoke_for_workspace_binaries() {
     let temp_dir = TempDir::new().expect("failed to create CLI smoke temp dir");
     let malformed_config = temp_dir.path().join("malformed.json");
     fs::write(&malformed_config, b"{ this is not JSON").expect("failed to write malformed config");
@@ -41,6 +41,7 @@ fn cli_smoke_for_client_and_server() {
     for (name, binary) in [
         ("tuic-server", PathBuf::from(SERVER_BIN)),
         ("tuic-client", client_bin()),
+        ("tuic-udp-forwarder", forwarder_bin()),
     ] {
         let help = run(&binary, &["--help"]);
         assert_success(name, "--help", &help);
@@ -165,6 +166,53 @@ fn udp_associate_relays_in_native_and_quic_modes() {
     }
 }
 
+#[test]
+#[ignore = "requires prebuilt workspace binaries"]
+fn udp_forwarder_preserves_end_to_end_tuic_tcp_and_udp() {
+    let mut harness = ServerHarness::start();
+    let config_path = harness.temp_dir.path().join("forwarder.json");
+    write_json(
+        &config_path,
+        &json!({
+            "server": "[::]:0",
+            "dual_stack": true,
+            "upstream": harness.relay_addr.to_string(),
+            "log_level": "warn"
+        }),
+    );
+    let mut forwarder = ProcessGuard::spawn("tuic-udp-forwarder", &forwarder_bin(), &config_path);
+    let forwarder_addr = forwarder.wait_for_address("UDP forwarder started, listening on ");
+
+    for mode in ["native", "quic"] {
+        let forwarder_host = if mode == "native" {
+            "127.0.0.1"
+        } else {
+            "localhost"
+        };
+        let (mut client, proxy_addr) = harness.start_client_at(
+            mode,
+            mode,
+            None,
+            Some(format!("{forwarder_host}:{}", forwarder_addr.port())),
+        );
+        let diagnostics = Diagnostics::new([
+            harness.log_capture(),
+            forwarder.log_capture(),
+            client.log_capture(),
+        ]);
+        with_diagnostics(&diagnostics, || {
+            socks_connect_round_trip(proxy_addr, &unique_payload("forwarded-socks"));
+            http_connect_round_trip(proxy_addr, &unique_payload("forwarded-http"));
+            udp_associate_round_trip(proxy_addr, &unique_payload("forwarded-udp"));
+            socks_connect_upload(proxy_addr, &vec![0x5a; 4 * 1024 * 1024]);
+        });
+        client.assert_running();
+        drop(client);
+    }
+    forwarder.assert_running();
+    harness.assert_running();
+}
+
 struct ServerHarness {
     server: Option<ProcessGuard>,
     temp_dir: TempDir,
@@ -219,17 +267,31 @@ impl ServerHarness {
         udp_relay_mode: &str,
         receive_window: Option<u32>,
     ) -> (ProcessGuard, SocketAddr) {
+        self.start_client_at(name, udp_relay_mode, receive_window, None)
+    }
+
+    fn start_client_at(
+        &self,
+        name: &'static str,
+        udp_relay_mode: &str,
+        receive_window: Option<u32>,
+        forwarder_server: Option<String>,
+    ) -> (ProcessGuard, SocketAddr) {
         let config_path = self.temp_dir.path().join(format!("client-{name}.json"));
         let mut relay = json!({
             "server": format!("localhost:{}", self.relay_addr.port()),
             "uuid": UUID,
             "password": RELAY_PASSWORD,
-            "ip": "127.0.0.1",
             "certificates": [&self.certificate],
             "udp_relay_mode": udp_relay_mode,
             "alpn": [ALPN],
             "disable_native_certs": true
         });
+        if let Some(forwarder_server) = forwarder_server {
+            relay["forwarder_server"] = json!(forwarder_server);
+        } else {
+            relay["ip"] = json!(self.relay_addr.ip().to_string());
+        }
         if let Some(receive_window) = receive_window {
             relay["receive_window"] = json!(receive_window);
         }
@@ -977,10 +1039,21 @@ fn client_bin() -> PathBuf {
         return path.into();
     }
 
+    workspace_bin("tuic-client")
+}
+
+fn forwarder_bin() -> PathBuf {
+    if let Some(path) = env::var_os("TUIC_UDP_FORWARDER_BIN") {
+        return path.into();
+    }
+    workspace_bin("tuic-udp-forwarder")
+}
+
+fn workspace_bin(name: &str) -> PathBuf {
     Path::new(SERVER_BIN)
         .parent()
         .expect("server binary path has no parent")
-        .join(format!("tuic-client{}", env::consts::EXE_SUFFIX))
+        .join(format!("{name}{}", env::consts::EXE_SUFFIX))
 }
 
 fn run(binary: &Path, args: &[&str]) -> Output {

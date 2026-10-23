@@ -2,8 +2,8 @@
 
 Minimalistic TUIC server implementation as a reference
 
-[![Version](https://img.shields.io/crates/v/tuic-server.svg?style=flat)](https://crates.io/crates/tuic-server)
-[![License](https://img.shields.io/crates/l/tuic-server.svg?style=flat)](https://github.com/EAimTY/tuic/blob/dev/LICENSE)
+[![Release](https://img.shields.io/github/v/release/Siglud/tuic?style=flat)](../../../releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=flat)](../LICENSE)
 
 # Overview
 
@@ -13,12 +13,12 @@ This implementation only contains the most basic requirements of a functional TU
 
 ## Usage
 
-Download the latest binary from [releases](https://github.com/EAimTY/tuic/releases).
+Download the latest binary from [releases](../../../releases).
 
-Or install from [crates.io](https://crates.io/crates/tuic-server):
+Or install this repository's version from a local checkout:
 
 ```bash
-cargo install tuic-server
+cargo install --path tuic-server --locked
 ```
 
 Run the TUIC server with configuration file:
@@ -26,6 +26,9 @@ Run the TUIC server with configuration file:
 ```bash
 tuic-server -c PATH/TO/CONFIG
 ```
+
+For a complete server/client/forwarder setup, see the
+[main usage guide](../README.md#usage).
 
 ## Configuration
 

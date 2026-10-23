@@ -2,23 +2,25 @@
 
 Minimalistic TUIC client implementation as a reference
 
-[![Version](https://img.shields.io/crates/v/tuic-client.svg?style=flat)](https://crates.io/crates/tuic-client)
-[![License](https://img.shields.io/crates/l/tuic-client.svg?style=flat)](https://github.com/EAimTY/tuic/blob/dev/LICENSE)
+[![Release](https://img.shields.io/github/v/release/Siglud/tuic?style=flat)](../../../releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=flat)](../LICENSE)
 
 # Overview
 
 The main goal of this TUIC client implementation is not to provide a full-featured, production-ready TUIC client, but to provide a minimal reference for the TUIC protocol client implementation.
 
-This implementation only contains the most basic requirements of a functional TUIC protocol client. If you are looking for features like HTTP-inbound, load-balance, etc., try other implementations, or implement them yourself.
+This implementation provides a local SOCKS5 proxy, optional HTTP proxy support,
+and an outbound TUIC connection, optionally through a UDP forwarder. It is not
+intended to provide advanced features such as load balancing.
 
 ## Usage
 
-Download the latest binary from [releases](https://github.com/EAimTY/tuic/releases).
+Download the latest binary from [releases](../../../releases).
 
-Or install from [crates.io](https://crates.io/crates/tuic-client):
+Or install this repository's version from a local checkout:
 
 ```bash
-cargo install tuic-client
+cargo install --path tuic-client --locked
 ```
 
 Run the TUIC client with configuration file:
@@ -26,6 +28,9 @@ Run the TUIC client with configuration file:
 ```bash
 tuic-client -c PATH/TO/CONFIG
 ```
+
+For a complete server/client/forwarder setup, see the
+[main usage guide](../README.md#usage).
 
 ## Configuration
 
@@ -36,7 +41,7 @@ tuic-client -c PATH/TO/CONFIG
         // Set the TUIC proxy server address
         // Format: "HOST:PORT"
         // The HOST must be a common name in the certificate
-        // If the "ip" field in the "relay" section is not set, the HOST is also used for DNS resolving
+        // With neither "ip" nor "forwarder_server" set, HOST is also used for DNS resolving
         "server": "example.com:443",
 
         // Set the user UUID
@@ -46,8 +51,16 @@ tuic-client -c PATH/TO/CONFIG
         "password": "PASSWORD",
 
         // Optional. The IP address of the TUIC proxy server, for overriding DNS resolving
-        // If not set, the HOST in the "server" field is used for DNS resolving
-        "ip": "127.0.0.1",
+        // For forwarding, use "forwarder_server" instead
+        // Cannot be combined with a non-null "forwarder_server"
+        "ip": null,
+
+        // Optional. Connect through a UDP forwarder, e.g. "forwarder.example.com:8443"
+        // Format: "HOST:PORT"; use "[ADDRESS]:PORT" for an IPv6 address
+        // The "server" field still identifies the real TUIC server for TLS/SNI
+        // Both the forwarder's hostname/IP and port are independent of "server"
+        // Cannot be combined with a non-null "ip"
+        "forwarder_server": null,
 
         // Optional. A list of certificates for TLS handshake
         // System native certificates are also loaded by default
@@ -149,6 +162,24 @@ tuic-client -c PATH/TO/CONFIG
     "log_level": "warn"
 }
 ```
+
+## Using a UDP forwarder
+
+The client can connect through [tuic-udp-forwarder](../tuic-udp-forwarder/README.md).
+Set `relay.forwarder_server` to the forwarder's hostname/IP and listening port.
+Keep `relay.server` set to the real TUIC server, including its original port,
+and keep its UUID, password, certificate trust, and ALPN settings unchanged.
+
+For example, set `"server": "exit.example.com:443"` and
+`"forwarder_server": "198.51.100.20:8443"` to connect through a forwarder at
+`198.51.100.20:8443`. TLS verification/SNI still uses `exit.example.com`.
+Forwarder hostnames are resolved when connecting, and bracketed IPv6 addresses
+are supported, e.g. `"forwarder_server": "[2001:db8::20]:8443"`.
+
+Do not set `relay.ip` when using `relay.forwarder_server`; the client rejects
+configurations that set both. Existing configurations without `forwarder_server`
+keep their previous behavior, including `relay.ip` DNS overrides. Forwarder
+failures do not cause a fallback to a direct connection to the real server.
 
 ## License
 

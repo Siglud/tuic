@@ -27,6 +27,8 @@ pub enum Error {
     WrongPacketSource,
     #[error("invalid socks5 authentication")]
     InvalidSocks5Auth,
+    #[error("relay.forwarder_server and relay.ip cannot both be set")]
+    ConflictingRelayAddresses,
 }
 
 impl From<ConnectionError> for Error {
