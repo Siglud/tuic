@@ -181,6 +181,8 @@ received datagrams to the exit server at `203.0.113.10:443`:
     "upstream": "203.0.113.10:443",
     // Optional. Positive mapping idle duration; keep above the heartbeat interval. Default: "60s".
     "idle_timeout": "60s",
+    // Optional. Recover unresponsive upstream mappings after "60s"; null disables this for one-way UDP.
+    "response_timeout": "60s",
     // Optional. Positive integer limit on simultaneous client IP/port mappings. Default: 1024.
     "max_clients": 1024
 }
@@ -195,7 +197,10 @@ tuic-udp-forwarder -c forwarder.json
 
 No TUIC server process, TLS certificate, or TUIC credentials are needed on this
 machine. The forwarder passes encrypted datagrams unchanged and routes replies
-back to each client.
+back to each client. It automatically replaces an upstream UDP mapping after
+60 seconds of unanswered client traffic, with a warning. Set `response_timeout`
+to `null` for intentional one-way UDP; see the
+[forwarder configuration reference](tuic-udp-forwarder/README.md#recovery-from-an-unresponsive-upstream).
 
 Update `client.json` to use the forwarder, then restart the client:
 

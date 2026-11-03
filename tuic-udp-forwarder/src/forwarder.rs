@@ -18,13 +18,34 @@ const MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
 struct Session {
     upstream: Arc<UdpSocket>,
     activity: watch::Sender<Instant>,
+    responses: watch::Receiver<Option<Instant>>,
+    unanswered_since: Option<Instant>,
     task: AbortHandle,
+}
+
+impl Session {
+    fn response_timed_out(&mut self, timeout: Duration) -> bool {
+        let Some(since) = self.unanswered_since else {
+            return false;
+        };
+        if self
+            .responses
+            .borrow()
+            .is_some_and(|received| received >= since)
+        {
+            self.unanswered_since = None;
+            false
+        } else {
+            since.elapsed() >= timeout
+        }
+    }
 }
 
 pub struct Forwarder {
     socket: Arc<UdpSocket>,
     upstream: SocketAddr,
     idle_timeout: Duration,
+    response_timeout: Option<Duration>,
     max_clients: usize,
     sessions: HashMap<SocketAddr, Session>,
     tasks: JoinSet<(SocketAddr, io::Result<()>)>,
@@ -67,6 +88,7 @@ impl Forwarder {
             socket: Arc::new(socket),
             upstream,
             idle_timeout: cfg.idle_timeout,
+            response_timeout: cfg.response_timeout,
             max_clients: cfg.max_clients.get(),
             sessions: HashMap::new(),
             tasks: JoinSet::new(),
@@ -115,8 +137,13 @@ impl Forwarder {
             self.sessions.remove(&client).unwrap().task.abort();
         }
 
-        if !self.sessions.contains_key(&client) {
-            if self.sessions.len() >= self.max_clients {
+        let recovery_timeout = self.response_timeout.filter(|timeout| {
+            self.sessions
+                .get_mut(&client)
+                .is_some_and(|session| session.response_timed_out(*timeout))
+        });
+        if !self.sessions.contains_key(&client) || recovery_timeout.is_some() {
+            if recovery_timeout.is_none() && self.sessions.len() >= self.max_clients {
                 return Err(io::Error::new(
                     ErrorKind::ConnectionRefused,
                     "maximum client mappings reached",
@@ -131,27 +158,48 @@ impl Forwarder {
             upstream.connect(self.upstream).await?;
             let upstream = Arc::new(upstream);
             let (activity, receiver) = watch::channel(Instant::now());
+            let (response_sender, responses) = watch::channel(None);
             let listener = self.socket.clone();
             let idle_timeout = self.idle_timeout;
             let session_upstream = upstream.clone();
             let task = self.tasks.spawn(async move {
                 (
                     client,
-                    run_session(listener, session_upstream, client, receiver, idle_timeout).await,
+                    run_session(
+                        listener,
+                        session_upstream,
+                        client,
+                        receiver,
+                        response_sender,
+                        idle_timeout,
+                    )
+                    .await,
                 )
             });
-            self.sessions.insert(
+            // Keep the old socket bound until its replacement has a different source port.
+            if let Some(previous) = self.sessions.insert(
                 client,
                 Session {
                     upstream,
                     activity,
+                    responses,
+                    unanswered_since: None,
                     task,
                 },
-            );
+            ) {
+                previous.task.abort();
+            }
+            if let Some(timeout) = recovery_timeout {
+                log::warn!(
+                    "[{client}] no upstream response for {}; recreated upstream UDP mapping",
+                    humantime::format_duration(timeout),
+                );
+            }
             log::debug!("[{client}] created upstream mapping");
         }
 
-        let session = &self.sessions[&client];
+        let session = self.sessions.get_mut(&client).unwrap();
+        let sent_at = Instant::now();
         let result = time::timeout(self.idle_timeout, session.upstream.send(packet))
             .await
             .map_err(|_| io::Error::new(ErrorKind::TimedOut, "upstream send timed out"))
@@ -159,6 +207,7 @@ impl Forwarder {
         match result {
             Ok(_) => {
                 session.activity.send_replace(Instant::now());
+                session.unanswered_since.get_or_insert(sent_at);
                 Ok(())
             }
             Err(err) => {
@@ -200,6 +249,7 @@ async fn run_session(
     upstream: Arc<UdpSocket>,
     client: SocketAddr,
     mut activity: watch::Receiver<Instant>,
+    responses: watch::Sender<Option<Instant>>,
     idle_timeout: Duration,
 ) -> io::Result<()> {
     let mut buffer = vec![0; MAX_DATAGRAM_SIZE];
@@ -220,6 +270,7 @@ async fn run_session(
             }
             result = upstream.recv(&mut buffer) => {
                 let len = result?;
+                responses.send_replace(Some(Instant::now()));
                 time::timeout(idle_timeout, listener.send_to(&buffer[..len], client))
                     .await.map_err(|_| io::Error::new(ErrorKind::TimedOut, "client send timed out"))??;
                 deadline = Instant::now() + idle_timeout;
@@ -528,6 +579,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receive(&upstream).await.0, b"replacement");
+    }
+
+    #[tokio::test]
+    async fn recreates_unresponsive_upstream_mapping_during_continuous_retries() {
+        let upstream = udp_socket().await;
+        let client = udp_socket().await;
+        let client_addr = client.local_addr().unwrap();
+        let mut cfg = config(upstream.local_addr().unwrap());
+        cfg.idle_timeout = Duration::from_secs(120);
+        cfg.max_clients = 1.try_into().unwrap();
+        let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+
+        forwarder
+            .forward_packet(client_addr, b"initial")
+            .await
+            .unwrap();
+        let (_, blocked_peer) = receive(&upstream).await;
+        for (advance, replace) in [(30, false), (29, false), (1, true)] {
+            time::pause();
+            time::advance(Duration::from_secs(advance)).await;
+            time::resume();
+            forwarder
+                .forward_packet(client_addr, b"retry")
+                .await
+                .unwrap();
+            let (payload, peer) = receive(&upstream).await;
+            assert_eq!(payload, b"retry");
+            if !replace {
+                assert_eq!(peer, blocked_peer);
+            } else {
+                assert_ne!(
+                    peer, blocked_peer,
+                    "retry reused the blackholed upstream socket"
+                );
+                upstream.send_to(b"recovered", peer).await.unwrap();
+                assert_eq!(receive(&client).await.0, b"recovered");
+            }
+        }
+
+        assert_eq!(forwarder.sessions.len(), 1);
+        let replacement_task = forwarder.sessions[&client_addr].task.id();
+        let result = forwarder.tasks.join_next_with_id().await.unwrap();
+        forwarder.reap_session(result);
+        assert_eq!(forwarder.sessions[&client_addr].task.id(), replacement_task);
+    }
+
+    #[tokio::test]
+    async fn responses_and_quiet_periods_preserve_mappings_until_replies_stop() {
+        let upstream = udp_socket().await;
+        let client = udp_socket().await;
+        let client_addr = client.local_addr().unwrap();
+        let mut cfg = config(upstream.local_addr().unwrap());
+        cfg.response_timeout = Some(Duration::from_secs(3));
+        let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+        forwarder
+            .forward_packet(client_addr, b"initial")
+            .await
+            .unwrap();
+        let (_, original_peer) = receive(&upstream).await;
+        upstream.send_to(b"reply", original_peer).await.unwrap();
+        receive(&client).await;
+
+        for delay in [2, 2, 2, 10] {
+            time::pause();
+            time::advance(Duration::from_secs(delay)).await;
+            time::resume();
+            forwarder
+                .forward_packet(client_addr, b"request")
+                .await
+                .unwrap();
+            let (_, peer) = receive(&upstream).await;
+            assert_eq!(peer, original_peer);
+            upstream.send_to(b"reply", peer).await.unwrap();
+            assert_eq!(receive(&client).await.0, b"reply");
+        }
+
+        forwarder
+            .forward_packet(client_addr, b"unanswered")
+            .await
+            .unwrap();
+        assert_eq!(receive(&upstream).await.1, original_peer);
+        for advance in [2, 1] {
+            time::pause();
+            time::advance(Duration::from_secs(advance)).await;
+            time::resume();
+            forwarder
+                .forward_packet(client_addr, b"retry")
+                .await
+                .unwrap();
+            let (_, peer) = receive(&upstream).await;
+            if advance == 2 {
+                assert_eq!(peer, original_peer);
+            } else {
+                assert_ne!(peer, original_peer);
+                upstream.send_to(b"recovered", peer).await.unwrap();
+                assert_eq!(receive(&client).await.0, b"recovered");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_response_timeout_preserves_one_way_mappings() {
+        let upstream = udp_socket().await;
+        let client = udp_socket().await;
+        let client_addr = client.local_addr().unwrap();
+        let mut cfg = config(upstream.local_addr().unwrap());
+        cfg.response_timeout = None;
+        cfg.idle_timeout = Duration::from_secs(120);
+        let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+        forwarder
+            .forward_packet(client_addr, b"initial")
+            .await
+            .unwrap();
+        let (_, original_peer) = receive(&upstream).await;
+
+        for _ in 0..2 {
+            time::pause();
+            time::advance(Duration::from_secs(61)).await;
+            time::resume();
+            forwarder
+                .forward_packet(client_addr, b"one-way")
+                .await
+                .unwrap();
+            assert_eq!(receive(&upstream).await.1, original_peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_is_per_client_and_uses_the_configured_response_timeout() {
+        let upstream = udp_socket().await;
+        let blocked_client = udp_socket().await;
+        let healthy_client = udp_socket().await;
+        let blocked_addr = blocked_client.local_addr().unwrap();
+        let healthy_addr = healthy_client.local_addr().unwrap();
+        let mut cfg = config(upstream.local_addr().unwrap());
+        cfg.response_timeout = Some(Duration::from_secs(3));
+        cfg.max_clients = 2.try_into().unwrap();
+        let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+        forwarder
+            .forward_packet(blocked_addr, b"blocked")
+            .await
+            .unwrap();
+        let (_, blocked_peer) = receive(&upstream).await;
+        forwarder
+            .forward_packet(healthy_addr, b"healthy")
+            .await
+            .unwrap();
+        let (_, healthy_peer) = receive(&upstream).await;
+        upstream.send_to(b"reply", healthy_peer).await.unwrap();
+        receive(&healthy_client).await;
+
+        time::pause();
+        time::advance(Duration::from_secs(3)).await;
+        time::resume();
+        forwarder
+            .forward_packet(blocked_addr, b"retry")
+            .await
+            .unwrap();
+        let (_, recovered_peer) = receive(&upstream).await;
+        assert_ne!(recovered_peer, blocked_peer);
+        upstream
+            .send_to(b"recovered", recovered_peer)
+            .await
+            .unwrap();
+        assert_eq!(receive(&blocked_client).await.0, b"recovered");
+
+        forwarder
+            .forward_packet(healthy_addr, b"still healthy")
+            .await
+            .unwrap();
+        assert_eq!(receive(&upstream).await.1, healthy_peer);
+        assert_eq!(forwarder.sessions.len(), 2);
     }
 
     #[tokio::test]
