@@ -25,6 +25,11 @@ struct Session {
 
 impl Session {
     fn response_timed_out(&mut self, timeout: Duration) -> bool {
+        // A trailing one-way packet, such as a QUIC ACK, must not expire a quiet mapping.
+        if self.activity.borrow().elapsed() >= timeout {
+            self.unanswered_since = None;
+            return false;
+        }
         let Some(since) = self.unanswered_since else {
             return false;
         };
@@ -680,6 +685,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_followed_by_idle_gap_restarts_unanswered_window() {
+        for gap in [60, 90] {
+            let upstream = udp_socket().await;
+            let client = udp_socket().await;
+            let client_addr = client.local_addr().unwrap();
+            let mut cfg = config(upstream.local_addr().unwrap());
+            cfg.idle_timeout = Duration::from_secs(300);
+            let mut forwarder = Forwarder::bind(&cfg).await.unwrap();
+
+            forwarder
+                .forward_packet(client_addr, b"initial")
+                .await
+                .unwrap();
+            let (_, original_peer) = receive(&upstream).await;
+            upstream.send_to(b"reply", original_peer).await.unwrap();
+            receive(&client).await;
+
+            time::pause();
+            time::advance(Duration::from_secs(1)).await;
+            time::resume();
+            forwarder.forward_packet(client_addr, b"ack").await.unwrap();
+            assert_eq!(receive(&upstream).await.1, original_peer);
+
+            time::pause();
+            time::advance(Duration::from_secs(gap)).await;
+            time::resume();
+            forwarder
+                .forward_packet(client_addr, b"request")
+                .await
+                .unwrap();
+            assert_eq!(
+                receive(&upstream).await.1,
+                original_peer,
+                "an ACK followed by {gap}s of silence rotated a healthy mapping"
+            );
+
+            for (advance, replace) in [(30, false), (29, false), (1, true)] {
+                time::pause();
+                time::advance(Duration::from_secs(advance)).await;
+                time::resume();
+                forwarder
+                    .forward_packet(client_addr, b"retry")
+                    .await
+                    .unwrap();
+                let (_, peer) = receive(&upstream).await;
+                if replace {
+                    assert_ne!(peer, original_peer);
+                    upstream.send_to(b"recovered", peer).await.unwrap();
+                    assert_eq!(receive(&client).await.0, b"recovered");
+                } else {
+                    assert_eq!(peer, original_peer);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_response_timeout_preserves_one_way_mappings() {
         let upstream = udp_socket().await;
         let client = udp_socket().await;
@@ -731,7 +793,15 @@ mod tests {
         receive(&healthy_client).await;
 
         time::pause();
-        time::advance(Duration::from_secs(3)).await;
+        time::advance(Duration::from_secs(2)).await;
+        time::resume();
+        forwarder
+            .forward_packet(blocked_addr, b"retry")
+            .await
+            .unwrap();
+        assert_eq!(receive(&upstream).await.1, blocked_peer);
+        time::pause();
+        time::advance(Duration::from_secs(1)).await;
         time::resume();
         forwarder
             .forward_packet(blocked_addr, b"retry")

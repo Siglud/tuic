@@ -71,7 +71,7 @@ Complete configuration (only `server` and `upstream` are required):
 | `upstream` | Fixed upstream `HOST:PORT`; IPv6 addresses use `[ADDRESS]:PORT` | Required |
 | `dual_stack` | Whether an IPv6 listener also accepts IPv4 | OS default |
 | `idle_timeout` | UDP mapping expiry after inactivity, e.g. `"60s"`; independent of QUIC connection expiry | `"60s"` when omitted |
-| `response_timeout` | Recreate an unresponsive upstream mapping on the next client datagram after this duration; `null` disables recovery | `"60s"` |
+| `response_timeout` | Recreate an unresponsive upstream mapping after this duration of unanswered client traffic; a client send gap at least this long restarts the window; `null` disables recovery | `"60s"` |
 | `max_clients` | Maximum simultaneous client IP/port mappings; must be positive | `1024` |
 | `log_level` | `off`, `error`, `warn`, `info`, `debug`, or `trace` | `"warn"` |
 
@@ -115,8 +115,10 @@ mapping alive even when its network flow silently drops all replies.
 
 By default, `response_timeout` recreates that client's upstream socket when a
 datagram arrives at least 60 seconds after the first unanswered send. Any
-upstream reply clears the pending response timeout; a quiet interval after a
-reply does not trigger recovery. The replacement socket is bound before the old
+upstream reply clears the pending response timeout. A gap between client sends
+of at least `response_timeout` restarts the unanswered window, so a final QUIC
+ACK followed by silence does not rotate a healthy mapping. Continuous retries
+with shorter gaps still trigger recovery. The replacement socket is bound before the old
 one closes, ensuring a different source port. Other clients are unaffected,
 and recovery works even at `max_clients`. A warning records each recovery.
 

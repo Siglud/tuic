@@ -198,7 +198,9 @@ tuic-udp-forwarder -c forwarder.json
 No TUIC server process, TLS certificate, or TUIC credentials are needed on this
 machine. The forwarder passes encrypted datagrams unchanged and routes replies
 back to each client. It automatically replaces an upstream UDP mapping after
-60 seconds of unanswered client traffic, with a warning. Set `response_timeout`
+60 seconds of unanswered client traffic, with a warning. A gap between client
+sends of at least `response_timeout` restarts that window, so an ACK followed
+by silence does not rotate a healthy mapping. Set `response_timeout`
 to `null` for intentional one-way UDP; see the
 [forwarder configuration reference](tuic-udp-forwarder/README.md#recovery-from-an-unresponsive-upstream).
 
