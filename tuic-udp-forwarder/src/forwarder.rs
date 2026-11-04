@@ -756,9 +756,9 @@ mod tests {
             .unwrap();
         let (_, original_peer) = receive(&upstream).await;
 
-        for _ in 0..2 {
+        for _ in 0..3 {
             time::pause();
-            time::advance(Duration::from_secs(61)).await;
+            time::advance(Duration::from_secs(30)).await;
             time::resume();
             forwarder
                 .forward_packet(client_addr, b"one-way")
