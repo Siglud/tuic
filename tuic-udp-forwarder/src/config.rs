@@ -25,6 +25,11 @@ pub struct Config {
         deserialize_with = "deserialize_timeout"
     )]
     pub idle_timeout: Duration,
+    #[serde(
+        default = "default_response_timeout",
+        deserialize_with = "deserialize_response_timeout"
+    )]
+    pub response_timeout: Option<Duration>,
     #[serde(default = "default_max_clients")]
     pub max_clients: NonZeroUsize,
     #[serde(default = "default_log_level")]
@@ -62,6 +67,10 @@ fn default_idle_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_response_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(60))
+}
+
 fn default_max_clients() -> NonZeroUsize {
     NonZeroUsize::new(1024).unwrap()
 }
@@ -72,12 +81,24 @@ fn default_log_level() -> LevelFilter {
 
 fn deserialize_timeout<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     let text = String::deserialize(deserializer)?;
+    parse_timeout(&text, "idle_timeout")
+}
+
+fn deserialize_response_timeout<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|text| parse_timeout(&text, "response_timeout"))
+        .transpose()
+}
+
+fn parse_timeout<E: DeError>(text: &str, field: &str) -> Result<Duration, E> {
     let duration = text.parse::<HumanDuration>().map_err(DeError::custom)?;
     let duration = Duration::from(duration);
     if duration.is_zero() || std::time::Instant::now().checked_add(duration).is_none() {
-        return Err(DeError::custom(
-            "idle_timeout must be positive and fit in a timer",
-        ));
+        return Err(DeError::custom(format!(
+            "{field} must be positive and fit in a timer"
+        )));
     }
     Ok(duration)
 }
@@ -134,6 +155,7 @@ mod tests {
             assert_eq!(config.server, "127.0.0.1:0".parse().unwrap());
             assert_eq!(config.upstream, "localhost:443");
             assert_eq!(config.idle_timeout, Duration::from_millis(1250));
+            assert_eq!(config.response_timeout, Some(Duration::from_secs(60)));
             assert_eq!(config.max_clients.get(), 1024);
             assert_eq!(config.log_level, LevelFilter::Warn);
         }
@@ -186,6 +208,7 @@ mod tests {
         assert_eq!(cfg.upstream, "localhost:443");
         assert_eq!(cfg.dual_stack, None);
         assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.response_timeout, Some(Duration::from_secs(60)));
         assert_eq!(cfg.max_clients.get(), 1024);
         assert_eq!(cfg.log_level, LevelFilter::Warn);
 
@@ -194,6 +217,7 @@ mod tests {
             "upstream": "[::1]:443",
             "dual_stack": true,
             "idle_timeout": "1250ms",
+            "response_timeout": "250ms",
             "max_clients": 5,
             "log_level": "debug"
         }))
@@ -202,8 +226,17 @@ mod tests {
         assert_eq!(cfg.upstream, "[::1]:443");
         assert_eq!(cfg.dual_stack, Some(true));
         assert_eq!(cfg.idle_timeout, Duration::from_millis(1250));
+        assert_eq!(cfg.response_timeout, Some(Duration::from_millis(250)));
         assert_eq!(cfg.max_clients.get(), 5);
         assert_eq!(cfg.log_level, LevelFilter::Debug);
+    }
+
+    #[test]
+    fn response_timeout_can_be_disabled() {
+        let mut config = minimal_config();
+        config["response_timeout"] = json!(null);
+        let config: Config = serde_json::from_value(config).unwrap();
+        assert_eq!(config.response_timeout, None);
     }
 
     #[test]
@@ -214,6 +247,11 @@ mod tests {
             ("idle_timeout", json!("")),
             ("idle_timeout", json!(null)),
             ("idle_timeout", json!("eventually")),
+            ("response_timeout", json!("0s")),
+            ("response_timeout", json!("")),
+            ("response_timeout", json!("eventually")),
+            ("response_timeout", json!(false)),
+            ("response_timeout", json!(60)),
             ("max_clients", json!(0)),
             ("max_clients", json!(-1)),
             ("log_level", json!("invalid")),
