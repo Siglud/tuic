@@ -451,7 +451,6 @@ mod tests {
         for readme in [
             include_str!("../README.md"),
             include_str!("../../README.md"),
-            include_str!("../../tuic-udp-forwarder/README.md"),
         ] {
             for block in readme.split("```jsonc").skip(1) {
                 let text = block.split_once("```").unwrap().0;
@@ -462,7 +461,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(examples, 4);
+        assert_eq!(examples, 3);
     }
 
     #[test]

@@ -184,7 +184,9 @@ garbage collection.
 
 ## Using a UDP forwarder
 
-The client can connect through [tuic-udp-forwarder](../tuic-udp-forwarder/README.md).
+The client can connect through an external UDP port forwarder that passes QUIC
+datagrams unchanged in both directions. The forwarder does not need TUIC
+credentials or TLS certificates.
 Set `relay.forwarder_server` to the forwarder's hostname/IP and listening port.
 Keep `relay.server` set to the real TUIC server, including its original port,
 and keep its UUID, password, certificate trust, and ALPN settings unchanged.
@@ -202,9 +204,7 @@ IPv6 or stale address therefore does not block a reachable IPv4 address for the
 entire connection timeout. TLS still uses `relay.server`, not the computer name.
 With multiple candidates, a completed handshake selects the winner even when
 `zero_rtt_handshake` is enabled; single-address connections still support 0-RTT.
-The forwarder must listen on the selected address family: `0.0.0.0:8443` accepts
-only IPv4; use `[::]:8443` with `dual_stack: true` to also accept IPv4 on an
-IPv6 listener where supported.
+Configure the forwarder to listen on an address family reachable by the client.
 
 Do not set `relay.ip` when using `relay.forwarder_server`; the client rejects
 configurations that set both. Existing configurations without `forwarder_server`
@@ -232,9 +232,8 @@ Windows error 10054), and other relay failures remain warnings because they
 are not confirmed normal cleanup. Updated servers finish successful TCP relays
 gracefully instead of resetting them.
 
-The forwarder's `idle_timeout` only expires UDP mappings; it does not override
-the server's QUIC timeout. See the
-[forwarder timeout explanation](../tuic-udp-forwarder/README.md#idle-timeout-versus-quic-connection-lifetime).
+An external forwarder's UDP mapping timeout does not override the server's QUIC
+idle timeout.
 
 ## License
 

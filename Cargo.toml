@@ -1,5 +1,5 @@
 [workspace]
-members = ["tuic", "tuic-quinn", "tuic-server", "tuic-client", "tuic-udp-forwarder"]
+members = ["tuic", "tuic-quinn", "tuic-server", "tuic-client"]
 resolver = "2"
 
 [profile.release]
