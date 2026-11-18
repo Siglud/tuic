@@ -36,14 +36,13 @@ There are 5 crates provided in this repository:
 - **[tuic-quinn](tuic-quinn/README.md)** - Library. A thin layer on top of [quinn](https://github.com/quinn-rs/quinn) to provide functions of TUIC
 - **[tuic-server](tuic-server/README.md)** - Binary. TUIC server that connects to the requested TCP and UDP destinations
 - **[tuic-client](tuic-client/README.md)** - Binary. Local SOCKS5 proxy with optional HTTP proxy support and an outbound TUIC connection
-- **[tuic-udp-forwarder](tuic-udp-forwarder/README.md)** - Binary. Standalone UDP forwarding to a fixed upstream without terminating QUIC/TLS; no TUIC credentials or certificates required on the forwarding node
 
 ## Usage
 
 ### Get the binaries
 
 Download the binaries for your platform from [releases](../../releases).
-To build all three tools from this repository, install Rust 1.89.0 or newer and run:
+To build the client and server, install Rust 1.89.0 or newer and run:
 
 ```sh
 git clone https://github.com/Siglud/tuic.git
@@ -53,12 +52,11 @@ cargo build --workspace --bins --release --locked
 
 The executables are in `target\release` and have the `.exe` extension on Windows.
 The commands below assume the executables are on your `PATH`; otherwise, use their
-full paths. Use client binaries built from a revision that includes
-`relay.forwarder_server` when following the forwarder setup below.
+full paths.
 
 ### Choose a topology
 
-Use the client and server alone for a direct connection, or add a UDP forwarder
+Use the client and server alone for a direct connection, or use an external UDP forwarder
 on a separate machine:
 
 ```text
@@ -66,7 +64,7 @@ Direct:
 Application -> tuic-client -> tuic-server -> destination
 
 Through a forwarder:
-Application -> tuic-client -> tuic-udp-forwarder -> tuic-server -> destination
+Application -> tuic-client -> UDP port forwarder -> tuic-server -> destination
                             QUIC/TLS stays end-to-end with the TUIC server
 ```
 
@@ -168,41 +166,12 @@ On Windows PowerShell, use `curl.exe` if `curl` resolves to a PowerShell alias.
 See the [client configuration reference](tuic-client/README.md)
 for authentication, TLS, UDP modes, and other options.
 
-### Add an optional UDP forwarder
+### Use an optional external UDP forwarder
 
-On the forwarding machine, create `forwarder.json`. This example sends all
-received datagrams to the exit server at `203.0.113.10:443`:
-
-```jsonc
-{
-    // Required. UDP listening IP and port on the forwarding machine.
-    "server": "0.0.0.0:8443",
-    // Required. Fixed upstream HOST:PORT; bracket IPv6 addresses as "[ADDRESS]:PORT".
-    "upstream": "203.0.113.10:443",
-    // Optional. Positive mapping idle duration; keep above the heartbeat interval. Default: "60s".
-    "idle_timeout": "60s",
-    // Optional. Recover unresponsive upstream mappings after "60s"; null disables this for one-way UDP.
-    "response_timeout": "60s",
-    // Optional. Positive integer limit on simultaneous client IP/port mappings. Default: 1024.
-    "max_clients": 1024
-}
-```
-
-`upstream` also accepts a domain and port, such as `exit.example.com:443`.
-Allow inbound **UDP port 8443** and outbound UDP to the exit server, then run:
-
-```sh
-tuic-udp-forwarder -c forwarder.json
-```
-
-No TUIC server process, TLS certificate, or TUIC credentials are needed on this
-machine. The forwarder passes encrypted datagrams unchanged and routes replies
-back to each client. It automatically replaces an upstream UDP mapping after
-60 seconds of unanswered client traffic, with a warning. A gap between client
-sends of at least `response_timeout` restarts that window, so an ACK followed
-by silence does not rotate a healthy mapping. Set `response_timeout`
-to `null` for intentional one-way UDP; see the
-[forwarder configuration reference](tuic-udp-forwarder/README.md#recovery-from-an-unresponsive-upstream).
+This repository no longer ships a standalone forwarder. Use a third-party UDP
+port forwarder, such as [Xray's tunnel inbound](https://xtls.github.io/en/config/inbounds/tunnel.html),
+to forward UDP port `8443` to `exit.example.com:443` and return replies to the
+client. Restrict access to the listener using a firewall or private network.
 
 Update `client.json` to use the forwarder, then restart the client:
 
@@ -243,13 +212,8 @@ Do not also set `relay.ip`: the client rejects configurations that set both
 `relay.ip` as a DNS override remain supported. Forwarder failures do not fall
 back to a direct connection to the real server.
 
-The forwarder creates a separate upstream UDP socket for each client IP/port
-and expires idle mappings. It has no local authentication or rate limiting;
-restrict access using a firewall or private network. The exit server sees the
-forwarder's IP rather than each client's original IP. Avoid forwarding loops
-and keep the idle timeout above the expected heartbeat interval. See the
-[forwarder configuration reference](tuic-udp-forwarder/README.md)
-for resource limits and other details.
+To switch back to a direct connection, remove `relay.forwarder_server` or set
+it to `null`, then restart the client.
 
 ## Testing
 
@@ -261,7 +225,8 @@ Run the workspace unit tests with all features enabled:
 cargo test --workspace --all-features --locked
 ```
 
-The end-to-end suite generates temporary TLS material, starts the real binaries, and exercises TCP and UDP relaying over localhost, both directly and through the UDP forwarder:
+The end-to-end suite generates temporary TLS material, starts the client and
+server, and exercises TCP and UDP relaying over localhost:
 
 ```bash
 cargo build --workspace --bins --locked

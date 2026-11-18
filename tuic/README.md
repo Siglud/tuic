@@ -41,9 +41,8 @@ tuic = { git = "https://github.com/Siglud/tuic", branch = "main", version = "5.0
 This protocol library is configured through its Rust API and does not read
 configuration files. For runnable tools, see the
 [main usage guide](../README.md#usage) and the commented configuration references
-for the [client](../tuic-client/README.md#configuration),
-[server](../tuic-server/README.md#configuration), and
-[UDP forwarder](../tuic-udp-forwarder/README.md#configuration). All three tools
+for the [client](../tuic-client/README.md#configuration) and
+[server](../tuic-server/README.md#configuration). Both tools
 parse config files as JSONC regardless of extension, including `.json`, with
 line/block comments and trailing commas supported. Plain JSON remains valid.
 
